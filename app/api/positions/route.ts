@@ -3,31 +3,26 @@ import { GraphQLClient, gql } from "graphql-request";
 
 export const revalidate = 30;
 
-// ------- Env -------
+// ----- ENV -----
 const SLIP_URL = process.env.AERO_SLIPSTREAM_SUBGRAPH || "";
-const SOLID_URL = process.env.AERO_SOLIDLY_SUBGRAPH || ""; // kept as-is; may not be supported by your subgraph yet
+const SOLID_URL = process.env.AERO_SOLIDLY_SUBGRAPH || "";
+const SUBGRAPH_KEY = process.env.SUBGRAPH_API_KEY || "";
+const BASE_RPC_URL = process.env.BASE_RPC_URL || "";
+const AERO_VOTER = (process.env.AERO_VOTER || "0x16613524e02ad97eDfeF371bC883F2F5d6C480A5").toLowerCase();
+const SLIPSTREAM_NFPM = (process.env.SLIPSTREAM_NFPM || "0x827922686190790b37229fd06084350E74485b72").toLowerCase();
 
-// Optional headers (harmless for The Graph; useful on other hosts)
-const SUBGRAPH_KEY = process.env.SUBGRAPH_API_KEY;
-const AUTH_HEADERS: Record<string, string> | undefined = SUBGRAPH_KEY
-  ? { "x-api-key": SUBGRAPH_KEY, "api-key": SUBGRAPH_KEY, Authorization: `Bearer ${SUBGRAPH_KEY}` }
-  : undefined;
-
-// Optional manual CSV of known staker/gauge addresses (lowercased)
-const STAKERS_FROM_ENV = (process.env.SLIPSTREAM_STAKERS || "")
-  .split(",")
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
-
-// ------- Clients -------
+// ----- Graph clients -----
 function makeClient(url: string | undefined) {
   if (!url) return null;
-  try { return new GraphQLClient(url, AUTH_HEADERS ? { headers: AUTH_HEADERS } : undefined); } catch { return null; }
+  const headers = SUBGRAPH_KEY
+    ? { "x-api-key": SUBGRAPH_KEY, "api-key": SUBGRAPH_KEY, Authorization: `Bearer ${SUBGRAPH_KEY}` }
+    : undefined;
+  try { return new GraphQLClient(url!, headers ? { headers } : undefined); } catch { return null; }
 }
 const slipClient = makeClient(SLIP_URL);
 const solidClient = makeClient(SOLID_URL);
 
-// ------- Helpers -------
+// ----- Helpers -----
 type Address = `0x${string}`;
 type TryResult<T> = { ok: true; data: T } | { ok: false; err: string };
 
@@ -42,139 +37,96 @@ async function tryQuery<T>(client: GraphQLClient | null, query: string, variable
   }
 }
 
-// ------- Discover Slipstream staker/gauges from subgraph -------
-const GAUGE_CANDIDATES = [
-  gql`{ clGauges { id } }`,
-  gql`{ gauges { id } }`,
-  gql`{ positionStakers { id } }`,
-  gql`{ nonfungiblePositionStakers { id } }`,
-];
-
-async function discoverStakers(client: GraphQLClient | null): Promise<Set<string>> {
-  const found = new Set<string>();
-  if (!client) return found;
-  for (const q of GAUGE_CANDIDATES) {
-    const r = await tryQuery<any>(client, q);
-    if (r.ok) {
-      const rows =
-        (r.data as any).clGauges ??
-        (r.data as any).gauges ??
-        (r.data as any).positionStakers ??
-        (r.data as any).nonfungiblePositionStakers ??
-        [];
-      for (const g of rows) {
-        const id = String(g.id || "").toLowerCase();
-        if (id) found.add(id);
-      }
-      break; // stop at first successful schema
-    }
-  }
-  for (const s of STAKERS_FROM_ENV) found.add(s);
-  return found;
+// --- Minimal JSON-RPC helper (no extra deps) ---
+async function rpc(method: string, params: any[]) {
+  if (!BASE_RPC_URL) throw new Error("BASE_RPC_URL missing");
+  const res = await fetch(BASE_RPC_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  const json = await res.json();
+  if (json.error) throw new Error(json.error.message || "rpc error");
+  return json.result;
 }
 
-// ------- Slipstream (positions) variants -------
-const SLIP_POSITIONS_CANDIDATES = [
-  gql`query($owners:[String!]!){
-    positions(where:{ owner_in:$owners }) {
-      id owner
-      liquidity tickLower tickUpper
-      collectedFeesToken0 collectedFeesToken1
-      depositedToken0 depositedToken1
-      withdrawnToken0 withdrawnToken1
-      pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick }
-    }
-  }`,
-  gql`query($owners:[String!]!){
-    positions(where:{ owner_in:$owners }) {
-      id owner
-      liquidity tickLower tickUpper
-      collectedFeesToken0 collectedFeesToken1
-      pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick }
-    }
-  }`,
-];
+// keccak256("Transfer(address,address,uint256)") for ERC-721
+const ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-// ------- Slipstream (depositor mapping) variants -------
-// Try common entity names that relate tokenId -> depositor (user/account/owner).
-const STAKED_OWNER_CANDIDATES = [
-  // stakedPositions by tokenId
-  gql`query($tokenIds:[String!]!){
-    stakedPositions(where:{ tokenId_in:$tokenIds }) { tokenId user { id } }
-  }`,
-  // stakedPositions by id (id == tokenId as string on some subs)
-  gql`query($tokenIds:[String!]!){
-    stakedPositions(where:{ id_in:$tokenIds }) { id user { id } }
-  }`,
-  // positionStakings
-  gql`query($tokenIds:[String!]!){
-    positionStakings(where:{ tokenId_in:$tokenIds }) { tokenId user { id } }
-  }`,
-  // stakes (owner field)
-  gql`query($tokenIds:[String!]!){
-    stakes(where:{ tokenId_in:$tokenIds }) { tokenId owner { id } }
-  }`,
-  // stakedNonFungiblePositions
-  gql`query($tokenIds:[String!]!){
-    stakedNonFungiblePositions(where:{ tokenId_in:$tokenIds }) { tokenId account { id } }
-  }`,
-];
-
-async function mapDepositorsBySubgraph(client: GraphQLClient, tokenIds: string[]) {
-  const map = new Map<string, string>();
-  if (!tokenIds.length) return map;
-  for (const q of STAKED_OWNER_CANDIDATES) {
-    const r = await tryQuery<any>(client, q, { tokenIds });
-    if (!r.ok) continue;
-    const data = r.data as any;
-
-    const push = (tid: any, ownerObj: any) => {
-      const tokenId = String(tid ?? "").toString();
-      const owner = ownerObj?.id ?? ownerObj;
-      if (tokenId && owner) map.set(tokenId, String(owner));
-    };
-
-    if (Array.isArray(data.stakedPositions)) {
-      for (const row of data.stakedPositions) {
-        push(row.tokenId ?? row.id, row.user);
-      }
-      break;
-    }
-    if (Array.isArray(data.positionStakings)) {
-      for (const row of data.positionStakings) push(row.tokenId, row.user);
-      break;
-    }
-    if (Array.isArray(data.stakes)) {
-      for (const row of data.stakes) push(row.tokenId, row.owner);
-      break;
-    }
-    if (Array.isArray(data.stakedNonFungiblePositions)) {
-      for (const row of data.stakedNonFungiblePositions) push(row.tokenId, row.account);
-      break;
-    }
-  }
-  return map;
+// topic helpers
+function toTopicAddress(addr: string) {
+  const a = addr.toLowerCase().replace(/^0x/, "");
+  return "0x" + "0".repeat(24) + a;
+}
+function tokenIdToTopic(id: string | number | bigint) {
+  const n = BigInt(id);
+  let hex = n.toString(16);
+  hex = hex.padStart(64, "0");
+  return "0x" + hex;
 }
 
-// ------- Solidly (classic) variants (kept; may not match your subgraph yet) -------
-const SOLID_CANDIDATES = [
-  gql`query($owners:[String!]!){
-    users(where:{ id_in:$owners }){
-      id
-      liquidityPositions {
-        pair {
-          id stable
-          token0{ id symbol decimals } token1{ id symbol decimals }
-          reserve0 reserve1 totalSupply
-        }
-        liquidityTokenBalance
-        gauge { id }
-      }
-    }
-  }`,
-  gql`query($owners:[String!]!){
-    liquidityPositions(where:{ user_in:$owners, liquidityTokenBalance_gt:"0" }) {
-      user { id }
+// Voter.gauges(pool) => gauge
+const VOTER_GAUGES_ABI_SELECTOR = "0x1f9a1d3f"; // bytes4(keccak256("gauges(address)"))
+// encode call data: 0x1f9a1d3f + left-padded pool address
+function encodeGaugesCall(pool: string) {
+  const p = pool.toLowerCase().replace(/^0x/, "");
+  return VOTER_GAUGES_ABI_SELECTOR + ("0".repeat(24) + p);
+}
+async function voterGaugeForPool(pool: string): Promise<string | null> {
+  try {
+    const data = encodeGaugesCall(pool);
+    const out = await rpc("eth_call", [{ to: AERO_VOTER, data }, "latest"]);
+    if (!out || out === "0x") return null;
+    // decode one address from 32-byte return
+    const addr = "0x" + out.slice(-40);
+    return addr.toLowerCase() === "0x0000000000000000000000000000000000000000" ? null : addr;
+  } catch {
+    return null;
+  }
+}
+
+// find depositor: last Transfer(to=gauge, tokenId=...) on NFPM
+async function findDepositorByLogs(tokenId: string, gauge: string): Promise<string | null> {
+  try {
+    const logs = await rpc("eth_getLogs", [{
+      address: SLIPSTREAM_NFPM,
+      topics: [
+        ERC721_TRANSFER_TOPIC,
+        null,
+        toTopicAddress(gauge),
+        tokenIdToTopic(tokenId),
+      ],
+      fromBlock: "0x1",
+      toBlock: "latest",
+    }]);
+    if (!Array.isArray(logs) || logs.length === 0) return null;
+    // take the latest by blockNumber
+    logs.sort((a: any, b: any) => BigInt(a.blockNumber) > BigInt(b.blockNumber) ? 1 : -1);
+    const last = logs[logs.length - 1];
+    const fromTopic = last.topics?.[1];
+    if (!fromTopic) return null;
+    return ("0x" + fromTopic.slice(-40)).toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+// ----- Queries -----
+const SLIP_POSITIONS = gql`query($owners:[String!]!){
+  positions(where:{ owner_in:$owners }) {
+    id owner
+    liquidity tickLower tickUpper
+    collectedFeesToken0 collectedFeesToken1
+    depositedToken0 depositedToken1
+    withdrawnToken0 withdrawnToken1
+    pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick }
+  }
+}`;
+
+const SOLID_USERS_LP = gql`query($owners:[String!]!){
+  users(where:{ id_in:$owners }){
+    id
+    liquidityPositions {
       pair {
         id stable
         token0{ id symbol decimals } token1{ id symbol decimals }
@@ -183,9 +135,10 @@ const SOLID_CANDIDATES = [
       liquidityTokenBalance
       gauge { id }
     }
-  }`,
-];
+  }
+}`;
 
+// ----- Handler -----
 export async function GET(req: NextRequest) {
   const addrs = req.nextUrl.searchParams.getAll("addresses[]").map(a => a.toLowerCase()).filter(Boolean) as Address[];
   if (!addrs.length) {
@@ -195,133 +148,101 @@ export async function GET(req: NextRequest) {
   const items: any[] = [];
   const notes: string[] = [];
 
-  // ---- Slipstream (CL) with staker discovery + depositor mapping ----
+  // ---- Slipstream (CL): include staked via on-chain Voter + logs mapping ----
   if (slipClient) {
-    const stakers = await discoverStakers(slipClient);
-    if (stakers.size) notes.push(`Slipstream: discovered ${stakers.size} staker(s).`);
-    if (STAKERS_FROM_ENV.length) notes.push(`Slipstream: ${STAKERS_FROM_ENV.length} staker(s) from env merged.`);
-    const ownersOrStakers = Array.from(new Set([...addrs, ...Array.from(stakers)]));
+    // Query both wallets and (later) gauge owners — we’ll add gauges as we discover them
+    const owners = new Set<string>(addrs);
 
-    // Fetch positions (wallets + stakers)
-    let slipOk = false, slipErrs: string[] = [];
-    let slipPositions: any[] = [];
-    for (const q of SLIP_POSITIONS_CANDIDATES) {
-      const r = await tryQuery<any>(slipClient, q, { owners: ownersOrStakers });
-      if (r.ok) {
-        slipPositions = (r.data as any).positions ?? [];
-        slipOk = true;
-        break;
-      } else {
-        slipErrs.push(r.err);
+    // First pull positions owned by wallets (unstaked) — and by any existing owners set (wallets only here)
+    const r = await tryQuery<any>(slipClient, SLIP_POSITIONS, { owners: Array.from(owners) });
+    if (!r.ok) {
+      notes.push(`Slipstream query failed: ${r.err}`);
+    } else {
+      let positions = (r.data as any).positions ?? [];
+
+      // Collect unique pools we see to compute gauges
+      const pools = new Set<string>(positions.map((p: any) => (p.pool?.id || "").toLowerCase()).filter(Boolean));
+
+      // For each pool, resolve gauge via Voter
+      const poolGauge = new Map<string, string>();
+      for (const pool of pools) {
+        const g = await voterGaugeForPool(pool);
+        if (g) poolGauge.set(pool, g.toLowerCase());
       }
-    }
-    if (!slipOk) {
-      notes.push(`Slipstream query failed. Tried ${SLIP_POSITIONS_CANDIDATES.length} variants. Last error: ${slipErrs.at(-1)}`);
-    }
+      if (poolGauge.size) notes.push(`Slipstream: resolved ${poolGauge.size} gauge(s) via Voter.`);
 
-    // Identify which tokenIds are staked (owner == staker)
-    const stakedTokenIds: string[] = [];
-    for (const p of slipPositions) {
-      const ownerRaw = p.owner?.id ?? p.owner;
-      const ownerLc = String(ownerRaw || "").toLowerCase();
-      if (stakers.has(ownerLc)) stakedTokenIds.push(String(p.id));
-    }
+      // If any position is actually staked (owner == gauge), we’ll map depositor via logs.
+      const toResolve: Array<{ tokenId: string; gauge: string }> = [];
 
-    // Map staked tokenIds back to depositor via subgraph
-    const depositorMap = await mapDepositorsBySubgraph(slipClient, stakedTokenIds);
+      for (const p of positions) {
+        const ownerRaw = p.owner?.id ?? p.owner;
+        const poolId = (p.pool?.id || "").toLowerCase();
+        const gauge = poolGauge.get(poolId);
+        const isStaked = !!gauge && String(ownerRaw || "").toLowerCase() === gauge;
 
-    // Normalize rows (replace owner with depositor when staked)
-    for (const p of slipPositions) {
-      const ownerRaw = p.owner?.id ?? p.owner;
-      const ownerLc = String(ownerRaw || "").toLowerCase();
-      const isStaked = stakers.has(ownerLc);
-      const mappedDepositor = isStaked ? depositorMap.get(String(p.id)) : undefined;
+        // try to map depositor if staked
+        let depositor: string | null = null;
+        if (isStaked) {
+          if (!BASE_RPC_URL) {
+            notes.push("BASE_RPC_URL missing: cannot resolve depositor for staked NFTs.");
+          } else {
+            toResolve.push({ tokenId: String(p.id), gauge });
+          }
+        }
 
-      const currentTick = Number(p.pool?.tick ?? 0);
-      const tickLower = Number(p.tickLower), tickUpper = Number(p.tickUpper);
-      const inRange = currentTick >= tickLower && currentTick <= tickUpper;
+        const currentTick = Number(p.pool?.tick ?? 0);
+        const tickLower = Number(p.tickLower), tickUpper = Number(p.tickUpper);
+        const inRange = currentTick >= tickLower && currentTick <= tickUpper;
 
-      items.push({
-        kind: "SLIPSTREAM",
-        owner: mappedDepositor ?? ownerRaw,           // <-- show original depositor if staked
-        tokenId: p.id,
-        token0: p.pool?.token0, token1: p.pool?.token1,
-        deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
-        current: null,
-        fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
-        emissions: null,
-        range: { tickLower, tickUpper, currentTick, status: inRange ? "IN" : "OUT" },
-        staked: isStaked,
-      });
-    }
+        items.push({
+          kind: "SLIPSTREAM",
+          owner: ownerRaw, // will replace with depositor after logs step if staked
+          tokenId: p.id,
+          poolId: p.pool?.id,
+          token0: p.pool?.token0, token1: p.pool?.token1,
+          deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
+          current: null,
+          fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
+          emissions: null,
+          range: { tickLower, tickUpper, currentTick, status: inRange ? "IN" : "OUT" },
+          staked: isStaked,
+        });
+      }
 
-    if (slipOk) notes.push(`Slipstream: positions loaded ✅ (${items.filter(i=>i.kind==='SLIPSTREAM').length} rows).`);
-    if (stakedTokenIds.length && depositorMap.size === 0) {
-      notes.push("Slipstream: staked NFTs found but could not resolve depositor from subgraph (schema doesn’t expose a stake mapping).");
-      notes.push("Tip: provide SLIPSTREAM_STAKERS and/or share the subgraph's stake entity name to add a precise mapping.");
+      // Resolve depositors via logs (batch)
+      if (toResolve.length && BASE_RPC_URL) {
+        let success = 0;
+        for (const { tokenId, gauge } of toResolve) {
+          const dep = await findDepositorByLogs(tokenId, gauge);
+          if (dep) {
+            // patch the item
+            const it = items.find((x) => x.kind === "SLIPSTREAM" && String(x.tokenId) === String(tokenId));
+            if (it) { it.owner = dep; success++; }
+          }
+        }
+        notes.push(`Slipstream: mapped ${success}/${toResolve.length} staked NFT(s) back to depositor via logs.`);
+      }
+
+      notes.push(`Slipstream: positions loaded ✅ (${items.filter(i => i.kind === "SLIPSTREAM").length} rows).`);
     }
   } else {
     notes.push("AERO_SLIPSTREAM_SUBGRAPH missing; skipping CL positions.");
   }
 
-  // ---- Solidly (Classic) — attempt, but may not be supported by your subgraph ----
+  // ---- Solidly (Classic) optional; your subgraph may not support it yet ----
   if (solidClient) {
-    let ok = false, errs: string[] = [];
-
-    // 1) users -> liquidityPositions
-    {
-      const r = await tryQuery<any>(solidClient, SOLID_CANDIDATES[0], { owners: addrs });
-      if (r.ok) {
-        const users = (r.data as any).users ?? [];
-        if (users.length) {
-          for (const u of users) {
-            for (const lp of (u.liquidityPositions ?? [])) {
-              const pair = lp.pair;
-              const owner = u.id;
-              const balance = Number(lp.liquidityTokenBalance ?? 0);
-              const totalSupply = Number(pair?.totalSupply ?? 0);
-              const share = totalSupply > 0 ? balance / totalSupply : 0;
-              const amt0 = share * Number(pair?.reserve0 ?? 0);
-              const amt1 = share * Number(pair?.reserve1 ?? 0);
-
-              items.push({
-                kind: "SOLIDLY",
-                owner,
-                lpToken: pair?.id,
-                token0: pair?.token0, token1: pair?.token1,
-                deposited: { token0: amt0.toString(), token1: amt1.toString() },
-                current: { token0: amt0.toString(), token1: amt1.toString() },
-                fees: null,
-                emissions: null,
-                range: null,
-                staked: !!lp.gauge,
-              });
-            }
-          }
-          notes.push("Solidly: matched users→liquidityPositions variant ✅");
-          ok = true;
-        } else {
-          errs.push("users[] query returned empty or unsupported.");
-        }
-      } else {
-        errs.push(r.err);
-      }
-    }
-
-    // 2) direct liquidityPositions
-    if (!ok) {
-      const r = await tryQuery<any>(solidClient, SOLID_CANDIDATES[1], { owners: addrs });
-      if (r.ok) {
-        const rows = (r.data as any).liquidityPositions ?? [];
-        for (const b of rows) {
-          const pair = b.pair;
-          const owner = b.user?.id ?? b.user;
-          const balance = Number(b.liquidityTokenBalance ?? 0);
+    const r = await tryQuery<any>(solidClient, SOLID_USERS_LP, { owners: addrs });
+    if (r.ok) {
+      const users = (r.data as any).users ?? [];
+      for (const u of users) {
+        for (const lp of (u.liquidityPositions ?? [])) {
+          const pair = lp.pair;
+          const owner = u.id;
+          const balance = Number(lp.liquidityTokenBalance ?? 0);
           const totalSupply = Number(pair?.totalSupply ?? 0);
           const share = totalSupply > 0 ? balance / totalSupply : 0;
           const amt0 = share * Number(pair?.reserve0 ?? 0);
           const amt1 = share * Number(pair?.reserve1 ?? 0);
-
           items.push({
             kind: "SOLIDLY",
             owner,
@@ -332,17 +253,15 @@ export async function GET(req: NextRequest) {
             fees: null,
             emissions: null,
             range: null,
-            staked: !!b.gauge,
+            staked: !!lp.gauge,
           });
         }
-        notes.push("Solidly: matched liquidityPositions variant ✅");
-        ok = true;
-      } else {
-        errs.push(r.err);
       }
+      if (!users.length) notes.push("Solidly: users[] empty (schema may differ).");
+      else notes.push("Solidly: matched users→liquidityPositions ✅");
+    } else {
+      notes.push(`Solidly query failed: ${r.err}`);
     }
-
-    if (!ok) notes.push(`Solidly query failed. Tried ${SOLID_CANDIDATES.length} variants. Last error: ${errs.at(-1)}`);
   } else {
     notes.push("AERO_SOLIDLY_SUBGRAPH missing; skipping Classic LP balances.");
   }
