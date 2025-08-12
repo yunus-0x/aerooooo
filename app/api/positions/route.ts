@@ -17,9 +17,13 @@ const SLIPSTREAM_NFPM = (process.env.SLIPSTREAM_NFPM || "0x827922686190790b37229
 function makeClient(url: string | undefined) {
   if (!url) return null;
   const headers = SUBGRAPH_KEY
-    ? { "x-api-key": SUBGRAPH_KEY, "api-key": SUBGRAPH_API_KEY, Authorization: `Bearer ${SUBGRAPH_KEY}` }
+    ? { "x-api-key": SUBGRAPH_KEY, "api-key": SUBGRAPH_KEY, Authorization: `Bearer ${SUBGRAPH_KEY}` }
     : undefined;
-  try { return new GraphQLClient(url!, headers ? { headers } : undefined); } catch { return null; }
+  try {
+    return new GraphQLClient(url!, headers ? { headers } : undefined);
+  } catch {
+    return null;
+  }
 }
 const slipClient = makeClient(SLIP_URL);
 const solidClient = makeClient(SOLID_URL);
