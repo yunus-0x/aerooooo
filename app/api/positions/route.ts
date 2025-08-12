@@ -98,6 +98,35 @@ async function depositorFromLogs(tokenId: string, gauge: string): Promise<string
   } catch { return null; }
 }
 
+// ----- Discover ALL staker/gauges from subgraph -----
+const GAUGE_CANDIDATES = [
+  gql`{ clGauges { id } }`,
+  gql`{ gauges { id } }`,
+  gql`{ positionStakers { id } }`,
+  gql`{ nonfungiblePositionStakers { id } }`,
+];
+async function discoverAllStakers(client: GraphQLClient | null): Promise<Set<string>> {
+  const set = new Set<string>();
+  if (!client) return set;
+  for (const q of GAUGE_CANDIDATES) {
+    const r = await tryQuery<any>(client, q);
+    if (r.ok) {
+      const rows =
+        (r.data as any).clGauges ??
+        (r.data as any).gauges ??
+        (r.data as any).positionStakers ??
+        (r.data as any).nonfungiblePositionStakers ??
+        [];
+      for (const g of rows) {
+        const id = String(g.id || "").toLowerCase();
+        if (id) set.add(id);
+      }
+      break; // first successful schema is enough
+    }
+  }
+  return set;
+}
+
 // ----- Slipstream position query (with field fallbacks) -----
 const SLIP_POSITIONS_V1 = gql`query($owners:[String!]!){
   positions(where:{ owner_in:$owners }) {
@@ -158,9 +187,17 @@ export async function GET(req: NextRequest) {
   const items: any[] = [];
   const notes: string[] = [];
 
-  // -------- SLIPSTREAM (wallet-owned first pass) --------
+  // -------- SLIPSTREAM --------
   let slipPositions: any[] = [];
-  if (slipClient) {
+
+  if (!slipClient) {
+    notes.push("AERO_SLIPSTREAM_SUBGRAPH missing; skipping CL positions.");
+  } else {
+    // 0) Discover ALL stakers/gauges from subgraph
+    const allStakers = await discoverAllStakers(slipClient);
+    if (allStakers.size) notes.push(`Slipstream: discovered ${allStakers.size} staker(s) from subgraph.`);
+
+    // 1) Wallet-owned positions (pass owners = wallets)
     let r = await tryQuery<any>(slipClient, SLIP_POSITIONS_V1, { owners: addrs });
     if (!r.ok) r = await tryQuery<any>(slipClient, SLIP_POSITIONS_V2, { owners: addrs });
     if (!r.ok) {
@@ -168,76 +205,88 @@ export async function GET(req: NextRequest) {
     } else {
       slipPositions = (r.data as any).positions ?? [];
     }
-  } else {
-    notes.push("AERO_SLIPSTREAM_SUBGRAPH missing; skipping CL positions.");
-  }
 
-  // resolve gauges for pools we saw
-  const poolIds = Array.from(new Set(slipPositions.map((p: any) => String(p.pool?.id || "").toLowerCase()).filter(Boolean)));
-  const poolGauge = new Map<string, string>();
-  for (const pid of poolIds) {
-    const g = await gaugeForPool(pid);
-    if (g) poolGauge.set(pid, g);
-  }
-  if (poolGauge.size) notes.push(`Slipstream: resolved ${poolGauge.size} gauge(s) via Voter.`);
+    // resolve gauges for pools seen (used for staked flag)
+    const poolIds = Array.from(new Set(slipPositions.map((p: any) => String(p.pool?.id || "").toLowerCase()).filter(Boolean)));
+    const poolGauge = new Map<string, string>();
+    for (const pid of poolIds) {
+      const g = await gaugeForPool(pid);
+      if (g) poolGauge.set(pid, g);
+    }
+    if (poolGauge.size) notes.push(`Slipstream: resolved ${poolGauge.size} gauge(s) via Voter.`);
 
-  // -------- SLIPSTREAM (gauge-owned second pass) --------
-  if (slipClient && poolGauge.size) {
-    const gauges = Array.from(new Set([...poolGauge.values()]));
-    let r2 = await tryQuery<any>(slipClient, SLIP_POSITIONS_V1, { owners: gauges });
-    if (!r2.ok) r2 = await tryQuery<any>(slipClient, SLIP_POSITIONS_V2, { owners: gauges });
-    if (r2.ok) {
-      const gaugePositions = (r2.data as any).positions ?? [];
-      for (const gp of gaugePositions) {
-        const poolId = String(gp.pool?.id || "").toLowerCase();
-        const gauge = poolGauge.get(poolId);
-        if (!gauge) continue;
-        const depositor = await depositorFromLogs(String(gp.id), gauge);
-        if (depositor && addrs.some(a => a.toLowerCase() === depositor.toLowerCase())) { // <-- TS-safe check
-          gp.owner = depositor;                 // show wallet as owner
-          (gp as any).__fromGauge = true;      // mark as staked
-          slipPositions.push(gp);
+    // 2) Gauge-owned positions (owner = ANY discovered staker)
+    if (allStakers.size) {
+      const gaugeList = Array.from(allStakers);
+      let r2 = await tryQuery<any>(slipClient, SLIP_POSITIONS_V1, { owners: gaugeList });
+      if (!r2.ok) r2 = await tryQuery<any>(slipClient, SLIP_POSITIONS_V2, { owners: gaugeList });
+      if (r2.ok) {
+        const gaugePositions = (r2.data as any).positions ?? [];
+
+        // Map depositor via logs and keep only those whose depositor is in addrs
+        for (const gp of gaugePositions) {
+          const poolId = String(gp.pool?.id || "").toLowerCase();
+          // for staked flag & in-range we also want the gauge address; try voter if not known
+          let gauge = poolGauge.get(poolId);
+          if (!gauge) {
+            const g = await gaugeForPool(poolId);
+            if (g) {
+              gauge = g;
+              poolGauge.set(poolId, g);
+            }
+          }
+          if (!gauge) continue;
+
+          const depositor = await depositorFromLogs(String(gp.id), gauge);
+          if (depositor && addrs.some(a => a.toLowerCase() === depositor.toLowerCase())) {
+            gp.owner = depositor;            // rewrite to wallet
+            (gp as any).__fromGauge = true;  // mark as staked
+            slipPositions.push(gp);
+          }
         }
+      } else {
+        notes.push(`Slipstream (gauge) query failed: ${r2.err}`);
       }
     } else {
-      notes.push(`Slipstream (gauge) query failed: ${r2.err}`);
+      notes.push("Slipstream: no stakers found in subgraph (cannot pull gauge-owned NFTs).");
     }
-  }
 
-  // -------- Normalize Slipstream rows --------
-  for (const p of slipPositions) {
-    const ownerRaw = p.owner?.id ?? p.owner;
-    const ownerLc = String(ownerRaw || "").toLowerCase();
-    const poolId = String(p.pool?.id || "").toLowerCase();
-    const gauge = poolGauge.get(poolId);
-    const staked = !!gauge && ownerLc === gauge && !(p as any).__fromGauge;
+    // 3) Normalize (wallet + matched gauge)
+    for (const p of slipPositions) {
+      const ownerRaw = p.owner?.id ?? p.owner;
+      const ownerLc = String(ownerRaw || "").toLowerCase();
 
-    const { tickLower, tickUpper, currentTick } = getTicks(p);
-    const inRange = tickLower !== null && tickUpper !== null && currentTick !== null
-      ? currentTick >= tickLower && currentTick <= tickUpper
-      : null;
+      const poolId = String(p.pool?.id || "").toLowerCase();
+      const gauge = poolGauge.get(poolId);
+      const staked = !!gauge && ownerLc === gauge && !(p as any).__fromGauge;
 
-    items.push({
-      kind: "SLIPSTREAM",
-      owner: ownerRaw,
-      tokenId: p.id,
-      poolId: p.pool?.id,
-      token0: p.pool?.token0, token1: p.pool?.token1,
-      deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
-      current: null,
-      fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
-      emissions: null,
-      range: {
-        tickLower,
-        tickUpper,
-        currentTick,
-        status: inRange === null ? "-" : (inRange ? "IN" : "OUT"),
-      },
-      staked: staked || !!(p as any).__fromGauge,
-    });
-  }
-  if (items.some(i => i.kind === "SLIPSTREAM")) {
-    notes.push(`Slipstream: positions loaded ✅ (${items.filter(i => i.kind==='SLIPSTREAM').length} rows).`);
+      const { tickLower, tickUpper, currentTick } = getTicks(p);
+      const inRange = tickLower !== null && tickUpper !== null && currentTick !== null
+        ? currentTick >= tickLower && currentTick <= tickUpper
+        : null;
+
+      items.push({
+        kind: "SLIPSTREAM",
+        owner: ownerRaw,
+        tokenId: p.id,
+        poolId: p.pool?.id,
+        token0: p.pool?.token0, token1: p.pool?.token1,
+        deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
+        current: null,
+        fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
+        emissions: null,
+        range: {
+          tickLower,
+          tickUpper,
+          currentTick,
+          status: inRange === null ? "-" : (inRange ? "IN" : "OUT"),
+        },
+        staked: staked || !!(p as any).__fromGauge,
+      });
+    }
+    if (items.some(i => i.kind === "SLIPSTREAM")) {
+      notes.push(`Slipstream: positions loaded ✅ (${items.filter(i => i.kind==='SLIPSTREAM').length} rows).`);
+    }
   }
 
   // -------- Solidly (optional) --------
