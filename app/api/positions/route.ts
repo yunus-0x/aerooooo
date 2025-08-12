@@ -7,7 +7,7 @@ export const revalidate = 30;
 const SLIP_URL = process.env.AERO_SLIPSTREAM_SUBGRAPH || "";
 const SOLID_URL = process.env.AERO_SOLIDLY_SUBGRAPH || "";
 
-// Optional headers (harmless for The Graph)
+// Optional headers (harmless for The Graph; useful on some hosts)
 const SUBGRAPH_KEY = process.env.SUBGRAPH_API_KEY;
 const AUTH_HEADERS: Record<string, string> | undefined = SUBGRAPH_KEY
   ? { "x-api-key": SUBGRAPH_KEY, "api-key": SUBGRAPH_KEY, Authorization: `Bearer ${SUBGRAPH_KEY}` }
@@ -24,7 +24,6 @@ const solidClient = makeClient(SOLID_URL);
 type Address = `0x${string}`;
 type TryResult<T> = { ok: true; data: T } | { ok: false; err: string };
 
-// --- helpers ---
 async function tryQuery<T>(client: GraphQLClient | null, query: string, variables: any): Promise<TryResult<T>> {
   if (!client) return { ok: false, err: "no client" };
   try {
@@ -36,77 +35,62 @@ async function tryQuery<T>(client: GraphQLClient | null, query: string, variable
   }
 }
 
-// ---------------- SLIPSTREAM (CL) candidates ----------------
+/** ---------------- SLIPSTREAM (CL) ----------------
+ * Many UniV3-style subs DON'T expose tokensOwed*, but DO expose:
+ * collectedFeesToken0/1, deposited/withdrawn, etc. We’ll use those.
+ */
 const SLIP_CANDIDATES = [
+  // Owner + collectedFees + pool.tick
   gql`query($owners:[String!]!){
     positions(where:{ owner_in:$owners }) {
       id owner liquidity tickLower tickUpper
-      tokensOwed0 tokensOwed1
+      collectedFeesToken0 collectedFeesToken1
+      depositedToken0 depositedToken1
+      withdrawnToken0 withdrawnToken1
       pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick }
     }
   }`,
+  // Same but sometimes the owner field is 'owner.id'
   gql`query($owners:[String!]!){
     positions(where:{ owner_in:$owners }) {
-      id owner liquidity tickLower tickUpper
-      owedToken0: tokensOwed0 owedToken1: tokensOwed1
-      pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } currentTick: tick }
-    }
-  }`,
-  gql`query($owners:[String!]!){
-    positions(where:{ account_in:$owners }) {
-      id owner:account liquidity tickLower tickUpper
-      tokensOwed0 tokensOwed1
+      id owner
+      liquidity tickLower tickUpper
+      collectedFeesToken0 collectedFeesToken1
       pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick }
     }
   }`,
 ];
 
-// ---------------- SOLIDLY (classic) candidates ----------------
+/** ---------------- SOLIDLY (Classic V2-like) ----------------
+ * Many Aerodrome/Velo forks provide liquidity via liquidityPositions.
+ * Some schemas prefer fetching via users{id_in:[]} -> liquidityPositions.
+ */
 const SOLID_CANDIDATES = [
-  // common in Aerodrome/Velo-style subs
+  // 1) users{id_in} -> liquidityPositions (most robust)
   gql`query($owners:[String!]!){
-    liquidityPositions(where:{ user_in:$owners, liquidity_gt:0 }) {
+    users(where:{ id_in:$owners }){
+      id
+      liquidityPositions {
+        pair {
+          id stable
+          token0{ id symbol decimals } token1{ id symbol decimals }
+          reserve0 reserve1 totalSupply
+        }
+        liquidityTokenBalance
+        gauge { id }
+      }
+    }
+  }`,
+  // 2) direct filter on liquidityPositions
+  gql`query($owners:[String!]!){
+    liquidityPositions(where:{ user_in:$owners, liquidityTokenBalance_gt: "0" }) {
       user { id }
       pair {
         id stable
         token0{ id symbol decimals } token1{ id symbol decimals }
         reserve0 reserve1 totalSupply
       }
-      liquidity
-    }
-  }`,
-  // alt key field
-  gql`query($owners:[String!]!){
-    liquidityPositions(where:{ account_in:$owners, liquidity_gt:0 }) {
-      user: account
-      pair {
-        id stable
-        token0{ id symbol decimals } token1{ id symbol decimals }
-        reserve0 reserve1 totalSupply
-      }
-      liquidity
-    }
-  }`,
-  // some indexers expose userBalances
-  gql`query($owners:[String!]!){
-    userBalances(where:{ user_in:$owners, balance_gt:0 }) {
-      user balance
-      pair {
-        id stable
-        token0{ id symbol decimals } token1{ id symbol decimals }
-        reserve0 reserve1 totalSupply
-      }
-      gauge { id }
-    }
-  }`,
-  gql`query($owners:[String!]!){
-    userBalances(where:{ account_in:$owners, balance_gt:0 }) {
-      user: account balance
-      pair {
-        id stable
-        token0{ id symbol decimals } token1{ id symbol decimals }
-        reserve0 reserve1 totalSupply
-      }
+      liquidityTokenBalance
       gauge { id }
     }
   }`,
@@ -121,63 +105,101 @@ export async function GET(req: NextRequest) {
   const items: any[] = [];
   const notes: string[] = [];
 
-  // ---- Slipstream: try candidates until one works
+  // ---- Slipstream
   if (slipClient) {
-    let slipOk = false, slipErrs: string[] = [];
+    let ok = false, errs: string[] = [];
     for (const q of SLIP_CANDIDATES) {
       const r = await tryQuery<any>(slipClient, q, { owners: addrs });
       if (r.ok) {
         const positions = (r.data as any).positions ?? [];
         for (const p of positions) {
-          const currentTick = Number(p.pool?.tick ?? p.pool?.currentTick ?? 0);
+          const currentTick = Number(p.pool?.tick ?? 0);
           const tickLower = Number(p.tickLower), tickUpper = Number(p.tickUpper);
           const inRange = currentTick >= tickLower && currentTick <= tickUpper;
           items.push({
             kind: "SLIPSTREAM",
-            owner: p.owner,
+            owner: p.owner?.id ?? p.owner,
             tokenId: p.id,
             token0: p.pool?.token0, token1: p.pool?.token1,
-            deposited: null, current: null,
-            fees: { token0: p.tokensOwed0 ?? p.owedToken0 ?? "0", token1: p.tokensOwed1 ?? p.owedToken1 ?? "0" },
+            deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
+            current: null, // computing live amounts from liquidity+ticks would be on-chain math
+            fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
             emissions: null,
             range: { tickLower, tickUpper, currentTick, status: inRange ? "IN" : "OUT" },
             staked: false,
           });
         }
-        slipOk = true;
         notes.push("Slipstream: matched schema variant ✅");
+        ok = true;
         break;
       } else {
-        slipErrs.push(r.err);
+        errs.push(r.err);
       }
     }
-    if (!slipOk) notes.push(`Slipstream query failed. Tried ${SLIP_CANDIDATES.length} variants. Last error: ${slipErrs.at(-1)}`);
+    if (!ok) notes.push(`Slipstream query failed. Tried ${SLIP_CANDIDATES.length} variants. Last error: ${errs.at(-1)}`);
   } else {
     notes.push("AERO_SLIPSTREAM_SUBGRAPH missing; skipping CL positions.");
   }
 
-  // ---- Solidly: try candidates until one works
+  // ---- Solidly
   if (solidClient) {
-    let solidOk = false, solidErrs: string[] = [];
-    for (const q of SOLID_CANDIDATES) {
+    let ok = false, errs: string[] = [];
+    // 1) users -> LPs
+    {
+      const q = SOLID_CANDIDATES[0];
       const r = await tryQuery<any>(solidClient, q, { owners: addrs });
       if (r.ok) {
-        const lpA = (r.data as any).liquidityPositions ?? [];
-        const ubA = (r.data as any).userBalances ?? [];
-        const rows = lpA.length ? lpA.map((x: any) => ({ kind: "LP", ...x })) : ubA.map((x: any) => ({ kind: "UB", ...x }));
-
+        const users = (r.data as any).users ?? [];
+        if (users.length) {
+          for (const u of users) {
+            for (const lp of (u.liquidityPositions ?? [])) {
+              const pair = lp.pair;
+              const owner = u.id;
+              const balance = Number(lp.liquidityTokenBalance ?? 0);
+              const totalSupply = Number(pair?.totalSupply ?? 0);
+              const share = totalSupply > 0 ? balance / totalSupply : 0;
+              const amt0 = share * Number(pair?.reserve0 ?? 0);
+              const amt1 = share * Number(pair?.reserve1 ?? 0);
+              items.push({
+                kind: "SOLIDLY",
+                owner,
+                lpToken: pair?.id,
+                token0: pair?.token0, token1: pair?.token1,
+                deposited: { token0: amt0.toString(), token1: amt1.toString() },
+                current: { token0: amt0.toString(), token1: amt1.toString() },
+                fees: null,
+                emissions: null,
+                range: null,
+                staked: !!lp.gauge,
+              });
+            }
+          }
+          notes.push("Solidly: matched users→liquidityPositions variant ✅");
+          ok = true;
+        } else {
+          errs.push("users[] query returned empty or not supported");
+        }
+      } else {
+        errs.push(r.err);
+      }
+    }
+    // 2) direct liquidityPositions filter
+    if (!ok) {
+      const q = SOLID_CANDIDATES[1];
+      const r = await tryQuery<any>(solidClient, q, { owners: addrs });
+      if (r.ok) {
+        const rows = (r.data as any).liquidityPositions ?? [];
         for (const b of rows) {
           const pair = b.pair;
-          const user = b.user?.id ?? b.user;
-          const balance = b.kind === "LP" ? Number(b.liquidity) : Number(b.balance);
+          const owner = b.user?.id ?? b.user;
+          const balance = Number(b.liquidityTokenBalance ?? 0);
           const totalSupply = Number(pair?.totalSupply ?? 0);
           const share = totalSupply > 0 ? balance / totalSupply : 0;
           const amt0 = share * Number(pair?.reserve0 ?? 0);
           const amt1 = share * Number(pair?.reserve1 ?? 0);
-
           items.push({
             kind: "SOLIDLY",
-            owner: user,
+            owner,
             lpToken: pair?.id,
             token0: pair?.token0, token1: pair?.token1,
             deposited: { token0: amt0.toString(), token1: amt1.toString() },
@@ -188,14 +210,13 @@ export async function GET(req: NextRequest) {
             staked: !!b.gauge,
           });
         }
-        solidOk = true;
-        notes.push("Solidly: matched schema variant ✅");
-        break;
+        notes.push("Solidly: matched liquidityPositions variant ✅");
+        ok = true;
       } else {
-        solidErrs.push(r.err);
+        errs.push(r.err);
       }
     }
-    if (!solidOk) notes.push(`Solidly query failed. Tried ${SOLID_CANDIDATES.length} variants. Last error: ${solidErrs.at(-1)}`);
+    if (!ok) notes.push(`Solidly query failed. Tried ${SOLID_CANDIDATES.length} variants. Last error: ${errs.at(-1)}`);
   } else {
     notes.push("AERO_SOLIDLY_SUBGRAPH missing; skipping Classic LP balances.");
   }
