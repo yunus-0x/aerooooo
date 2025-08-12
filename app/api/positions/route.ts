@@ -1,37 +1,35 @@
 import { NextRequest, NextResponse } from "next/server";
 import { GraphQLClient, gql } from "graphql-request";
 
-const SLIP_URL = process.env.AERO_SLIPSTREAM_SUBGRAPH || "";
-const SOLID_URL = process.env.AERO_SOLIDLY_SUBGRAPH || "";
-// const GAUGES_URL = process.env.AERO_GAUGES_SUBGRAPH || "";
-
-// Fallback-safe clients
-function makeClient(url: string | undefined) {
-  if (!url) return null;
-  try { return new GraphQLClient(url); } catch { return null; }
-}
-
-const AUTH_HEADERS: Record<string, string> = (() => {
-  const key = process.env.SUBGRAPH_API_KEY || "";
-  if (!key) return {};
-  return {
-    "x-api-key": key,
-    "api-key": key,
-    "Authorization": `Bearer ${key}`,
-  };
-})();
-
-function makeAuthClient(url: string | undefined) {
-  if (!url) return null;
-  try { return new GraphQLClient(url, { headers: AUTH_HEADERS }); } catch { return null; }
-}
-
-const slipClient = makeAuthClient(SLIP_URL);
-const solidClient = makeAuthClient(SOLID_URL);
-
 export const revalidate = 30;
 
-// --- Templates: adjust to match your indexers ---
+// Env
+const SLIP_URL = process.env.AERO_SLIPSTREAM_SUBGRAPH || "";
+const SOLID_URL = process.env.AERO_SOLIDLY_SUBGRAPH || "";
+
+// Optional auth headers (useful for Goldsky, harmless for The Graph)
+const SUBGRAPH_KEY = process.env.SUBGRAPH_API_KEY;
+const AUTH_HEADERS: Record<string, string> | undefined = SUBGRAPH_KEY
+  ? {
+      "x-api-key": SUBGRAPH_KEY,
+      "api-key": SUBGRAPH_KEY,
+      Authorization: `Bearer ${SUBGRAPH_KEY}`,
+    }
+  : undefined;
+
+function makeClient(url: string | undefined) {
+  if (!url) return null;
+  try {
+    return new GraphQLClient(url, AUTH_HEADERS ? { headers: AUTH_HEADERS } : undefined);
+  } catch {
+    return null;
+  }
+}
+
+const slipClient = makeClient(SLIP_URL);
+const solidClient = makeClient(SOLID_URL);
+
+// ---------- TEMPLATE QUERIES (adjust to your schema) ----------
 const SLIP_POSITIONS = gql`
   query SlipPositions($owners: [String!]!) {
     positions(where: { owner_in: $owners }) {
@@ -71,24 +69,28 @@ const SOLID_LPS = gql`
     }
   }
 `;
+// ---------------------------------------------------------------
 
 type Address = `0x${string}`;
 
 export async function GET(req: NextRequest) {
-  const addrs = req.nextUrl.searchParams.getAll("addresses[]")
-    .map(a => a.toLowerCase())
+  const addrs = req.nextUrl.searchParams
+    .getAll("addresses[]")
+    .map((a) => a.toLowerCase())
     .filter(Boolean) as Address[];
 
   if (!addrs.length) {
-    return NextResponse.json({ items: [], note: "Pass addresses[]=0x... in the query string." });
+    return NextResponse.json({
+      items: [],
+      notes: ["Pass addresses[]=0x... in the query string."],
+    });
   }
 
   const items: any[] = [];
-  let slip: any[] = [];
-  let solid: any[] = [];
   const notes: string[] = [];
 
-  // Slipstream (optional if URL provided)
+  // Slipstream CL positions
+  let slip: any[] = [];
   if (slipClient) {
     try {
       const r = await slipClient.request(SLIP_POSITIONS, { owners: addrs });
@@ -100,7 +102,8 @@ export async function GET(req: NextRequest) {
     notes.push("AERO_SLIPSTREAM_SUBGRAPH missing; skipping CL positions.");
   }
 
-  // Solidly (optional if URL provided)
+  // Solidly (classic) LP balances
+  let solid: any[] = [];
   if (solidClient) {
     try {
       const r = await solidClient.request(SOLID_LPS, { owners: addrs });
@@ -125,15 +128,12 @@ export async function GET(req: NextRequest) {
       tokenId: p.id,
       token0: p.pool?.token0,
       token1: p.pool?.token1,
-      deposited: null, // needs indexer support
-      current: null,   // could be computed on-chain from liquidity + ticks
-      fees: {
-        token0: p.tokensOwed0,
-        token1: p.tokensOwed1,
-      },
-      emissions: null, // fill via gauge earned() or indexer
+      deposited: null, // requires indexer support
+      current: null, // could be computed on-chain from liquidity & ticks
+      fees: { token0: p.tokensOwed0, token1: p.tokensOwed1 },
+      emissions: null, // add via gauge earned() or indexer
       range: { tickLower, tickUpper, currentTick, status: inRange ? "IN" : "OUT" },
-      staked: false,   // set true if your indexer provides it
+      staked: false, // set true if your indexer exposes it
     });
   }
 
