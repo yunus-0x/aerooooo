@@ -3,28 +3,35 @@ import { GraphQLClient, gql } from "graphql-request";
 
 export const revalidate = 30;
 
-// Env
+// ------- Env -------
 const SLIP_URL = process.env.AERO_SLIPSTREAM_SUBGRAPH || "";
 const SOLID_URL = process.env.AERO_SOLIDLY_SUBGRAPH || "";
 
-// Optional headers (harmless for The Graph; useful on some hosts)
+// Optional headers (harmless for The Graph; useful for other hosts)
 const SUBGRAPH_KEY = process.env.SUBGRAPH_API_KEY;
 const AUTH_HEADERS: Record<string, string> | undefined = SUBGRAPH_KEY
   ? { "x-api-key": SUBGRAPH_KEY, "api-key": SUBGRAPH_KEY, Authorization: `Bearer ${SUBGRAPH_KEY}` }
   : undefined;
 
+// Optional manual CSV of known staker/gauge addresses (lowercased)
+const STAKERS_FROM_ENV = (process.env.SLIPSTREAM_STAKERS || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// ------- Clients -------
 function makeClient(url: string | undefined) {
   if (!url) return null;
   try { return new GraphQLClient(url, AUTH_HEADERS ? { headers: AUTH_HEADERS } : undefined); } catch { return null; }
 }
-
 const slipClient = makeClient(SLIP_URL);
 const solidClient = makeClient(SOLID_URL);
 
+// ------- Helpers -------
 type Address = `0x${string}`;
 type TryResult<T> = { ok: true; data: T } | { ok: false; err: string };
 
-async function tryQuery<T>(client: GraphQLClient | null, query: string, variables: any): Promise<TryResult<T>> {
+async function tryQuery<T>(client: GraphQLClient | null, query: string, variables?: any): Promise<TryResult<T>> {
   if (!client) return { ok: false, err: "no client" };
   try {
     const r = await client.request<T>(query, variables);
@@ -35,12 +42,42 @@ async function tryQuery<T>(client: GraphQLClient | null, query: string, variable
   }
 }
 
-/** ---------------- SLIPSTREAM (CL) ----------------
- * Many UniV3-style subs DON'T expose tokensOwed*, but DO expose:
- * collectedFeesToken0/1, deposited/withdrawn, etc. We’ll use those.
- */
+// ------- Discover Slipstream staker/gauges from subgraph -------
+const GAUGE_CANDIDATES = [
+  gql`{ clGauges { id } }`,                       // common CL gauge entity
+  gql`{ gauges { id } }`,                         // generic gauges
+  gql`{ positionStakers { id } }`,                // some subs use this name
+  gql`{ nonfungiblePositionStakers { id } }`,     // another variant
+];
+
+async function discoverStakers(client: GraphQLClient | null): Promise<Set<string>> {
+  const found = new Set<string>();
+  if (!client) return found;
+  for (const q of GAUGE_CANDIDATES) {
+    const r = await tryQuery<any>(client, q);
+    if (r.ok) {
+      const rows =
+        (r.data as any).clGauges ??
+        (r.data as any).gauges ??
+        (r.data as any).positionStakers ??
+        (r.data as any).nonfungiblePositionStakers ??
+        [];
+      for (const g of rows) {
+        const id = String(g.id || "").toLowerCase();
+        if (id) found.add(id);
+      }
+      // stop at first success
+      break;
+    }
+  }
+  // merge env-provided stakers
+  for (const s of STAKERS_FROM_ENV) found.add(s);
+  return found;
+}
+
+// ------- Queries (match your working Slipstream variant; try fallbacks) -------
 const SLIP_CANDIDATES = [
-  // Owner + collectedFees + pool.tick
+  // Works on many Aerodrome/UniV3-like subs that track collected fees & deposits
   gql`query($owners:[String!]!){
     positions(where:{ owner_in:$owners }) {
       id owner liquidity tickLower tickUpper
@@ -50,23 +87,19 @@ const SLIP_CANDIDATES = [
       pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick }
     }
   }`,
-  // Same but sometimes the owner field is 'owner.id'
+  // Slightly slimmer variant
   gql`query($owners:[String!]!){
     positions(where:{ owner_in:$owners }) {
-      id owner
-      liquidity tickLower tickUpper
+      id owner liquidity tickLower tickUpper
       collectedFeesToken0 collectedFeesToken1
       pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick }
     }
   }`,
 ];
 
-/** ---------------- SOLIDLY (Classic V2-like) ----------------
- * Many Aerodrome/Velo forks provide liquidity via liquidityPositions.
- * Some schemas prefer fetching via users{id_in:[]} -> liquidityPositions.
- */
+// Classic (Solidly) variants — your subgraph may not support these; we try politely.
 const SOLID_CANDIDATES = [
-  // 1) users{id_in} -> liquidityPositions (most robust)
+  // 1) users -> liquidityPositions (most common)
   gql`query($owners:[String!]!){
     users(where:{ id_in:$owners }){
       id
@@ -81,9 +114,9 @@ const SOLID_CANDIDATES = [
       }
     }
   }`,
-  // 2) direct filter on liquidityPositions
+  // 2) direct filter
   gql`query($owners:[String!]!){
-    liquidityPositions(where:{ user_in:$owners, liquidityTokenBalance_gt: "0" }) {
+    liquidityPositions(where:{ user_in:$owners, liquidityTokenBalance_gt:"0" }) {
       user { id }
       pair {
         id stable
@@ -96,6 +129,7 @@ const SOLID_CANDIDATES = [
   }`,
 ];
 
+// ------- Handler -------
 export async function GET(req: NextRequest) {
   const addrs = req.nextUrl.searchParams.getAll("addresses[]").map(a => a.toLowerCase()).filter(Boolean) as Address[];
   if (!addrs.length) {
@@ -105,31 +139,42 @@ export async function GET(req: NextRequest) {
   const items: any[] = [];
   const notes: string[] = [];
 
-  // ---- Slipstream
+  // ---- Slipstream (CL) with staker discovery ----
   if (slipClient) {
+    const stakers = await discoverStakers(slipClient);
+    if (stakers.size) notes.push(`Slipstream: discovered ${stakers.size} staker(s).`);
+    if (STAKERS_FROM_ENV.length) notes.push(`Slipstream: ${STAKERS_FROM_ENV.length} staker(s) from env merged.`);
+
+    const ownersOrStakers = Array.from(new Set([...addrs, ...Array.from(stakers)]));
+
     let ok = false, errs: string[] = [];
     for (const q of SLIP_CANDIDATES) {
-      const r = await tryQuery<any>(slipClient, q, { owners: addrs });
+      const r = await tryQuery<any>(slipClient, q, { owners: ownersOrStakers });
       if (r.ok) {
         const positions = (r.data as any).positions ?? [];
         for (const p of positions) {
+          const ownerRaw = p.owner?.id ?? p.owner;
+          const ownerLc = String(ownerRaw || "").toLowerCase();
+          const isStaked = stakers.has(ownerLc);
+
           const currentTick = Number(p.pool?.tick ?? 0);
           const tickLower = Number(p.tickLower), tickUpper = Number(p.tickUpper);
           const inRange = currentTick >= tickLower && currentTick <= tickUpper;
+
           items.push({
             kind: "SLIPSTREAM",
-            owner: p.owner?.id ?? p.owner,
+            owner: ownerRaw,
             tokenId: p.id,
             token0: p.pool?.token0, token1: p.pool?.token1,
             deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
-            current: null, // computing live amounts from liquidity+ticks would be on-chain math
+            current: null, // on-chain math from liquidity + ticks if you want live composition
             fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
-            emissions: null,
+            emissions: null, // fill from gauge earned() if you have gauge ABI/addresses
             range: { tickLower, tickUpper, currentTick, status: inRange ? "IN" : "OUT" },
-            staked: false,
+            staked: isStaked,
           });
         }
-        notes.push("Slipstream: matched schema variant ✅");
+        notes.push("Slipstream: positions loaded ✅ (including staked via gauge owners).");
         ok = true;
         break;
       } else {
@@ -141,13 +186,13 @@ export async function GET(req: NextRequest) {
     notes.push("AERO_SLIPSTREAM_SUBGRAPH missing; skipping CL positions.");
   }
 
-  // ---- Solidly
+  // ---- Solidly (Classic) — try common variants, but your subgraph may not support it ----
   if (solidClient) {
     let ok = false, errs: string[] = [];
-    // 1) users -> LPs
+
+    // 1) users -> liquidityPositions
     {
-      const q = SOLID_CANDIDATES[0];
-      const r = await tryQuery<any>(solidClient, q, { owners: addrs });
+      const r = await tryQuery<any>(solidClient, SOLID_CANDIDATES[0], { owners: addrs });
       if (r.ok) {
         const users = (r.data as any).users ?? [];
         if (users.length) {
@@ -160,6 +205,7 @@ export async function GET(req: NextRequest) {
               const share = totalSupply > 0 ? balance / totalSupply : 0;
               const amt0 = share * Number(pair?.reserve0 ?? 0);
               const amt1 = share * Number(pair?.reserve1 ?? 0);
+
               items.push({
                 kind: "SOLIDLY",
                 owner,
@@ -177,16 +223,16 @@ export async function GET(req: NextRequest) {
           notes.push("Solidly: matched users→liquidityPositions variant ✅");
           ok = true;
         } else {
-          errs.push("users[] query returned empty or not supported");
+          errs.push("users[] query returned empty or unsupported.");
         }
       } else {
         errs.push(r.err);
       }
     }
-    // 2) direct liquidityPositions filter
+
+    // 2) direct liquidityPositions
     if (!ok) {
-      const q = SOLID_CANDIDATES[1];
-      const r = await tryQuery<any>(solidClient, q, { owners: addrs });
+      const r = await tryQuery<any>(solidClient, SOLID_CANDIDATES[1], { owners: addrs });
       if (r.ok) {
         const rows = (r.data as any).liquidityPositions ?? [];
         for (const b of rows) {
@@ -197,6 +243,7 @@ export async function GET(req: NextRequest) {
           const share = totalSupply > 0 ? balance / totalSupply : 0;
           const amt0 = share * Number(pair?.reserve0 ?? 0);
           const amt1 = share * Number(pair?.reserve1 ?? 0);
+
           items.push({
             kind: "SOLIDLY",
             owner,
@@ -216,6 +263,7 @@ export async function GET(req: NextRequest) {
         errs.push(r.err);
       }
     }
+
     if (!ok) notes.push(`Solidly query failed. Tried ${SOLID_CANDIDATES.length} variants. Last error: ${errs.at(-1)}`);
   } else {
     notes.push("AERO_SOLIDLY_SUBGRAPH missing; skipping Classic LP balances.");
