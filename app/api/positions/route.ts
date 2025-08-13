@@ -249,10 +249,13 @@ export async function GET(req: NextRequest) {
 
   // 4C) RPC fallback (per-token, only if needed)
   // Use only for gauge-owned tokens we couldn't map via subgraph
-  if (BASE_RPC_URL && gaugePositions.length) {
-    const unmapped = gaugePositions
-      .map(p => ({ tid: String(p.id), staker: String(p.owner?.id ?? p.owner || "").toLowerCase() }))
-      .filter(x => x.tid && x.staker && !depositorOf.has(x.tid));
+if (BASE_RPC_URL && gaugePositions.length) {
+  const unmapped = gaugePositions
+    .map((p) => {
+      const stakerRaw = ((p?.owner?.id ?? p?.owner) ?? ""); // add parens to avoid ?? with ||
+      return { tid: String(p.id), staker: String(stakerRaw).toLowerCase() };
+    })
+    .filter((x) => x.tid && x.staker && !depositorOf.has(x.tid));
     let rpcHits = 0;
     for (const { tid, staker } of unmapped) {
       const dep = await depositorFromLogs(tid, staker);
