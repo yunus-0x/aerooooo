@@ -1,10 +1,5 @@
-import "./globals.css";
-import Providers from "./providers";
-
-export const metadata = {
-  title: "Aerodrome Positions Monitor (Base)",
-  description: "Staked + unstaked LPs, fees, emissions, in-range, CoinGecko pricing",
-};
+import Providers from './providers';
+import './globals.css';
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
