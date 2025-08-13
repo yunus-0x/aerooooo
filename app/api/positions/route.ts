@@ -1,284 +1,326 @@
-// app/api/positions-rpc/route.ts
 import { NextRequest, NextResponse } from "next/server";
+import { GraphQLClient, gql } from "graphql-request";
 
-export const revalidate = 20;
+export const revalidate = 30;
 
-// ========= ENV =========
-const BASE_RPC_URL = process.env.BASE_RPC_URL || "";
-const SLIPSTREAM_NFPM = (process.env.SLIPSTREAM_NFPM || "0x827922686190790b37229fd06084350E74485b72").toLowerCase();
-// Optional accelerators:
-const BASESCAN_API_KEY = process.env.BASESCAN_API_KEY || "";    // speeds up discovery (recommended)
-const SLIPSTREAM_FACTORY = (process.env.SLIPSTREAM_FACTORY || "").toLowerCase(); // for live tick (IN/OUT)
+/** ============ ENV ============ */
+const SLIP_URL = process.env.AERO_SLIPSTREAM_SUBGRAPH || "";
+const SUBGRAPH_KEY = process.env.SUBGRAPH_API_KEY || "";
+const STAKERS_FROM_ENV = (process.env.SLIPSTREAM_STAKERS || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 
-// ========= Low-level RPC =========
-async function rpc(method: string, params: any[]) {
-  if (!BASE_RPC_URL) throw new Error("BASE_RPC_URL missing");
-  const res = await fetch(BASE_RPC_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-  });
-  const j = await res.json();
-  if (j.error) throw new Error(j.error.message || "rpc error");
-  return j.result;
+/** ============ GraphQL client ============ */
+function makeClient(url: string | undefined) {
+  if (!url) return null;
+  const headers = SUBGRAPH_KEY
+    ? { "x-api-key": SUBGRAPH_KEY, "api-key": SUBGRAPH_KEY, Authorization: `Bearer ${SUBGRAPH_KEY}` }
+    : undefined;
+  try { return new GraphQLClient(url!, headers ? { headers } : undefined); } catch { return null; }
 }
+const slipClient = makeClient(SLIP_URL);
 
-const pad32 = (hexNo0x: string) => hexNo0x.padStart(64, "0");
-const toTopicAddress = (addr: string) => "0x" + "0".repeat(24) + addr.toLowerCase().replace(/^0x/, "");
-const tokenIdToTopic = (id: string | number | bigint) => "0x" + BigInt(id).toString(16).padStart(64, "0");
+/** ============ Helpers ============ */
+type TryResult<T> = { ok: true; data: T } | { ok: false; err: string };
 
-// Selectors
-const SEL_OWNER_OF = "0x6352211e";  // ownerOf(uint256)
-const SEL_POSITIONS = "0x514ea4bf"; // positions(uint256)
-const SEL_DECIMALS = "0x313ce567";  // decimals()
-const SEL_SYMBOL   = "0x95d89b41";  // symbol()
-const SEL_FACTORY  = "0xc45a0155";  // factory() on NFPM
-const SEL_GETPOOL  = "0x1698ee82";  // getPool(address,address,uint24)
-const SEL_SLOT0    = "0x3850c7bd";  // slot0()
-const ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-
-// Utils
-function hexToAddress(hex: string) {
-  if (!hex || hex === "0x") return null;
-  return ("0x" + hex.slice(-40)).toLowerCase() as `0x${string}`;
-}
-function wordAt(hex: string, idx: number) {
-  return "0x" + hex.slice(2 + idx * 64, 2 + (idx + 1) * 64);
-}
-function parseInt24Signed(wordHex: string) {
-  const x = BigInt(wordHex);
-  const mask = (1n << 24n) - 1n;
-  let v = x & mask;
-  if (v >> 23n) v = v - (1n << 24n);
-  return Number(v);
-}
-function parseUint(wordHex: string) {
-  return BigInt(wordHex);
-}
-
-// Simple calls
-async function call(to: string, data: string) {
-  const out: string = await rpc("eth_call", [{ to, data }, "latest"]);
-  return out;
-}
-async function ownerOf(nfpm: string, tokenId: string) {
-  const out = await call(nfpm, SEL_OWNER_OF + tokenIdToTopic(tokenId).slice(2));
-  return hexToAddress(out);
-}
-async function positions(nfpm: string, tokenId: string) {
-  const out = await call(nfpm, SEL_POSITIONS + tokenIdToTopic(tokenId).slice(2));
-  if (!out || out.length < 2 + 64 * 12) throw new Error("positions: bad return");
-  return {
-    token0: hexToAddress(wordAt(out, 2))!,
-    token1: hexToAddress(wordAt(out, 3))!,
-    fee: Number(BigInt(wordAt(out, 4))),
-    tickLower: parseInt24Signed(wordAt(out, 5)),
-    tickUpper: parseInt24Signed(wordAt(out, 6)),
-    liquidity: wordAt(out, 7),
-    tokensOwed0: wordAt(out, 10),
-    tokensOwed1: wordAt(out, 11),
-  };
-}
-async function decimals(token: string): Promise<number | null> {
+async function tryQuery<T>(client: GraphQLClient | null, query: string, variables?: any): Promise<TryResult<T>> {
+  if (!client) return { ok: false, err: "no client" };
   try {
-    const out = await call(token, SEL_DECIMALS);
-    return Number(BigInt(out));
-  } catch { return null; }
-}
-async function symbol(token: string): Promise<string | null> {
-  try {
-    const out = await call(token, SEL_SYMBOL);
-    // bytes32 vs dynamic string handling
-    if (out.length === 2 + 64) {
-      const bytes = Buffer.from(out.slice(2), "hex");
-      return bytes.toString("utf8").replace(/\u0000+$/, "") || null;
-    }
-    const len = Number(BigInt(wordAt(out, 1)));
-    const raw = out.slice(2 + 64 * 2, 2 + 64 * 2 + len * 2);
-    return Buffer.from(raw, "hex").toString("utf8");
-  } catch { return null; }
+    const r = await client.request<T>(query, variables);
+    return { ok: true, data: r };
+  } catch (e: any) {
+    const msg = e?.response?.errors?.map((x: any) => x.message).join("; ") || e?.message || "unknown";
+    return { ok: false, err: msg };
+  }
 }
 
-// Factory / pool tick
-async function nfpmFactory(): Promise<string | null> {
-  if (SLIPSTREAM_FACTORY) return SLIPSTREAM_FACTORY;
-  try {
-    const out = await call(SLIPSTREAM_NFPM, SEL_FACTORY);
-    return hexToAddress(out);
-  } catch { return null; }
-}
-function encGetPool(token0: string, token1: string, fee: number) {
-  const t0 = token0.toLowerCase().replace(/^0x/, "");
-  const t1 = token1.toLowerCase().replace(/^0x/, "");
-  const feeHex = fee.toString(16).padStart(64, "0");
-  return SEL_GETPOOL + pad32(t0) + pad32(t1) + feeHex;
-}
-async function currentTickFor(token0: string, token1: string, fee: number): Promise<number | null> {
-  const factory = await nfpmFactory();
-  if (!factory) return null;
-  const poolOut = await call(factory, encGetPool(token0, token1, fee));
-  const pool = hexToAddress(poolOut);
-  if (!pool) return null;
-  const slot0 = await call(pool, SEL_SLOT0);
-  return parseInt24Signed(wordAt(slot0, 1));
-}
+/** ============ Schema candidates ============ */
+/* 1) Discover staker/gauge addresses */
+const GAUGE_CANDIDATES = [
+  gql`{ clGauges { id } }`,
+  gql`{ gauges { id } }`,
+  gql`{ positionStakers { id } }`,
+  gql`{ nonfungiblePositionStakers { id } }`,
+];
 
-// ===== TokenId discovery =====
+/* 2) Positions by owner (with tick field fallbacks) */
+const POSITIONS_BY_OWNER_V1 = gql`query($owners:[String!]!){
+  positions(where:{ owner_in:$owners }) {
+    id owner
+    liquidity
+    tickLower tickUpper
+    collectedFeesToken0 collectedFeesToken1
+    depositedToken0 depositedToken1
+    withdrawnToken0 withdrawnToken1
+    pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick }
+  }
+}`;
+const POSITIONS_BY_OWNER_V2 = gql`query($owners:[String!]!){
+  positions(where:{ owner_in:$owners }) {
+    id owner
+    liquidity
+    lowerTick: tickLower
+    upperTick: tickUpper
+    collectedFeesToken0 collectedFeesToken1
+    pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } currentTick: tick }
+  }
+}`;
 
-// BaseScan (fast path, optional)
-async function tokenIdsFromBasescan(wallet: string): Promise<Set<string>> {
+/* 3) Stake mapping (tokenId -> user/account/owner) */
+const STAKED_BY_USER_CANDIDATES = [
+  gql`query($owners:[String!]!){ stakedPositions(where:{ user_in:$owners }) { tokenId user{ id } } }`,
+  gql`query($owners:[String!]!){ positionStakings(where:{ user_in:$owners }) { tokenId user{ id } } }`,
+  gql`query($owners:[String!]!){ stakes(where:{ owner_in:$owners }) { tokenId owner{ id } } }`,
+  gql`query($owners:[String!]!){ stakedNonFungiblePositions(where:{ account_in:$owners }) { tokenId account{ id } } }`,
+];
+
+/* 4) Transfers (latest to=staker → from is depositor) */
+const TRANSFERS_TO_STAKER_CANDIDATES = [
+  // Most common names
+  gql`query($tokenIds:[String!]!,$tos:[String!]!){
+    positionTransfers(
+      where:{ tokenId_in:$tokenIds, to_in:$tos }
+      orderBy:blockNumber, orderDirection:desc, first:100
+    ){ tokenId from{ id } to{ id } blockNumber }
+  }`,
+  gql`query($tokenIds:[String!]!,$tos:[String!]!){
+    nonfungiblePositionTransfers(
+      where:{ tokenId_in:$tokenIds, to_in:$tos }
+      orderBy:blockNumber, orderDirection:desc, first:100
+    ){ tokenId from{ id } to{ id } blockNumber }
+  }`,
+  gql`query($tokenIds:[String!]!,$tos:[String!]!){
+    transfers(
+      where:{ tokenId_in:$tokenIds, to_in:$tos }
+      orderBy:blockNumber, orderDirection:desc, first:100
+    ){ tokenId from{ id } to{ id } blockNumber }
+  }`,
+  gql`query($tokenIds:[String!]!,$tos:[String!]!){
+    transferEvents(
+      where:{ tokenId_in:$tokenIds, to_in:$tos }
+      orderBy:blockNumber, orderDirection:desc, first:100
+    ){ tokenId from{ id } to{ id } blockNumber }
+  }`,
+];
+
+/* 5) Positions by id list (to rehydrate staked tokenIds) */
+const POSITIONS_BY_IDS = gql`query($ids:[String!]!){
+  positions(where:{ id_in:$ids }) {
+    id owner
+    liquidity
+    tickLower tickUpper
+    lowerTick: tickLower
+    upperTick: tickUpper
+    collectedFeesToken0 collectedFeesToken1
+    depositedToken0 depositedToken1
+    withdrawnToken0 withdrawnToken1
+    pool { id feeTier token0{ id symbol decimals } token1{ id symbol decimals } tick currentTick: tick }
+  }
+}`;
+
+/** ============ Discovery functions ============ */
+async function discoverStakers(client: GraphQLClient | null): Promise<Set<string>> {
   const set = new Set<string>();
-  if (!BASESCAN_API_KEY) return set;
-  const url = new URL("https://api.basescan.org/api");
-  url.searchParams.set("module", "account");
-  url.searchParams.set("action", "tokennfttx");
-  url.searchParams.set("address", wallet);
-  url.searchParams.set("contractaddress", SLIPSTREAM_NFPM);
-  url.searchParams.set("page", "1");
-  url.searchParams.set("offset", "10000");
-  url.searchParams.set("sort", "asc");
-  url.searchParams.set("apikey", BASESCAN_API_KEY);
-  const res = await fetch(url.toString());
-  const j = await res.json();
-  if (j?.status === "1" && Array.isArray(j.result)) {
-    for (const r of j.result) {
-      const tid = String(r.tokenID || r.tokenId || "");
-      if (tid) set.add(tid);
+  if (!client) return set;
+  for (const q of GAUGE_CANDIDATES) {
+    const r = await tryQuery<any>(client, q);
+    if (r.ok) {
+      const rows =
+        (r.data as any).clGauges ??
+        (r.data as any).gauges ??
+        (r.data as any).positionStakers ??
+        (r.data as any).nonfungiblePositionStakers ??
+        [];
+      for (const g of rows) {
+        const id = String(g.id || "").toLowerCase();
+        if (id) set.add(id);
+      }
+      break; // first schema that works is enough
     }
   }
+  // merge manual
+  for (const s of STAKERS_FROM_ENV) set.add(s);
   return set;
 }
 
-// Chunked RPC logs (no API key needed)
-async function tokenIdsFromLogsChunked(wallet: string): Promise<Set<string>> {
-  const set = new Set<string>();
-
-  // provider-friendly windowing
-  const headHex: string = await rpc("eth_blockNumber", []);
-  const head = Number(BigInt(headHex));
-  const WINDOW = 100_000;            // ~manageable per call
-  const MAX_LOOKBACK = 6_000_000;    // adjust as needed (~60 calls)
-  let end = head;
-  let scanned = 0;
-
-  while (end > 0 && scanned < MAX_LOOKBACK) {
-    const start = Math.max(0, end - WINDOW);
-    const fromBlock = "0x" + start.toString(16);
-    const toBlock = "0x" + end.toString(16);
-
-    // to = wallet
-    const fTo = { address: SLIPSTREAM_NFPM, topics: [ERC721_TRANSFER_TOPIC, null, toTopicAddress(wallet)], fromBlock, toBlock };
-    // from = wallet
-    const fFrom = { address: SLIPSTREAM_NFPM, topics: [ERC721_TRANSFER_TOPIC, toTopicAddress(wallet)], fromBlock, toBlock };
-
-    try {
-      const [logsTo, logsFrom] = await Promise.allSettled([
-        rpc("eth_getLogs", [fTo as any]),
-        rpc("eth_getLogs", [fFrom as any]),
-      ]);
-
-      const pushLogs = (res: any) => {
-        if (res.status === "fulfilled" && Array.isArray(res.value)) {
-          for (const l of res.value as any[]) {
-            const tid = l.topics?.[3];
-            if (tid) set.add(BigInt(tid).toString());
-          }
-        }
-      };
-      pushLogs(logsTo);
-      pushLogs(logsFrom);
-    } catch { /* ignore window errors */ }
-
-    scanned += WINDOW;
-    end = start;
-    // small optimization: stop early if we already found a bunch
-    if (set.size >= 200) break;
+async function getStakeMappedTokenIds(client: GraphQLClient, owners: string[]): Promise<Map<string,string>> {
+  const map = new Map<string,string>(); // tokenId -> depositor
+  for (const q of STAKED_BY_USER_CANDIDATES) {
+    const r = await tryQuery<any>(client, q, { owners });
+    if (!r.ok) continue;
+    const d = r.data as any;
+    const rows = d.stakedPositions ?? d.positionStakings ?? d.stakes ?? d.stakedNonFungiblePositions ?? [];
+    for (const row of rows) {
+      const tid = String(row.tokenId ?? row.id ?? "");
+      const who = row.user?.id ?? row.owner?.id ?? row.account?.id ?? row.user ?? row.owner ?? row.account;
+      if (tid && who) map.set(tid, String(who).toLowerCase());
+    }
+    if (map.size) break; // stop at first working schema
   }
-
-  return set;
+  return map;
 }
 
-// ===== API =====
+async function mapDepositorsFromTransfers(client: GraphQLClient, tokenIds: string[], stakers: string[]): Promise<Map<string,string>> {
+  const map = new Map<string,string>(); // tokenId -> depositor
+  if (!tokenIds.length || !stakers.length) return map;
+  for (const q of TRANSFERS_TO_STAKER_CANDIDATES) {
+    const r = await tryQuery<any>(client, q, { tokenIds, tos: stakers });
+    if (!r.ok) continue;
+    const rows = (r.data as any).positionTransfers ??
+                 (r.data as any).nonfungiblePositionTransfers ??
+                 (r.data as any).transfers ??
+                 (r.data as any).transferEvents ?? [];
+    // They are already ordered desc; keep first per tokenId
+    for (const tr of rows) {
+      const tid = String(tr.tokenId ?? "");
+      const from = tr.from?.id ?? tr.from;
+      if (tid && from && !map.has(tid)) {
+        map.set(tid, String(from).toLowerCase());
+      }
+    }
+    if (map.size) break; // stop at first schema that works
+  }
+  return map;
+}
+
+/** ============ Util ============ */
+function normalizeTicks(p: any) {
+  const tl = p.tickLower ?? p.lowerTick ?? null;
+  const tu = p.tickUpper ?? p.upperTick ?? null;
+  const ct = p.pool?.tick ?? p.pool?.currentTick ?? null;
+  let inRange: boolean | null = null;
+  if (tl !== null && tu !== null && ct !== null) {
+    const tln = Number(tl), tun = Number(tu), ctn = Number(ct);
+    inRange = ctn >= tln && ctn <= tun;
+    return { tickLower: tln, tickUpper: tun, currentTick: ctn, status: inRange ? "IN" : "OUT" as const };
+  }
+  return { tickLower: tl, tickUpper: tu, currentTick: ct, status: "-" as const };
+}
+
+/** ============ API Handler ============ */
 export async function GET(req: NextRequest) {
-  const url = new URL(req.url);
-  const addrs = url.searchParams.getAll("addresses[]").map(a => a.toLowerCase()).filter(Boolean);
-  const explicitIds = url.searchParams.getAll("tokenIds[]").map(s => s.trim()).filter(Boolean); // manual override if you know ids
-
-  if (!addrs.length && !explicitIds.length) {
-    return NextResponse.json({ items: [], notes: ["Pass addresses[]=0x... or tokenIds[]=123"] });
+  const addrs = req.nextUrl.searchParams.getAll("addresses[]").map(a => a.toLowerCase()).filter(Boolean);
+  if (!addrs.length) {
+    return NextResponse.json({ items: [], notes: ["Pass addresses[]=0x... in the query string."] });
   }
 
   const items: any[] = [];
   const notes: string[] = [];
 
-  // 1) Collect tokenIds
-  const tokenIds = new Set<string>(explicitIds);
-  if (addrs.length) {
-    for (const w of addrs) {
-      let ids = await tokenIdsFromBasescan(w);
-      if (ids.size === 0) {
-        notes.push(`BaseScan empty for ${w.slice(0,6)}… — scanning RPC logs in chunks`);
-        ids = await tokenIdsFromLogsChunked(w);
-      }
-      if (ids.size === 0) {
-        notes.push(`No NFPM activity found for ${w.slice(0,6)}… via either path`);
-      } else {
-        ids.forEach(id => tokenIds.add(id));
-      }
-    }
-  }
-
-  if (tokenIds.size === 0) {
-    if (!BASESCAN_API_KEY) notes.push("Tip: add BASESCAN_API_KEY for faster discovery.");
-    notes.push("If you know a tokenId, call: /api/positions-rpc?tokenIds[]=<id>");
+  if (!slipClient) {
+    notes.push("AERO_SLIPSTREAM_SUBGRAPH missing.");
     return NextResponse.json({ items, notes });
   }
 
-  // 2) For each tokenId, read everything on-chain
-  for (const tokenId of tokenIds) {
-    try {
-      const p = await positions(SLIPSTREAM_NFPM, tokenId);
-      const owner = await ownerOf(SLIPSTREAM_NFPM, tokenId);
+  /** 1) Wallet-owned positions */
+  let walletPositions: any[] = [];
+  {
+    let r = await tryQuery<any>(slipClient, POSITIONS_BY_OWNER_V1, { owners: addrs });
+    if (!r.ok) r = await tryQuery<any>(slipClient, POSITIONS_BY_OWNER_V2, { owners: addrs });
+    if (r.ok) walletPositions = (r.data as any).positions ?? [];
+    else notes.push(`Wallet positions query failed: ${r.err}`);
+  }
 
-      // token meta
-      const [dec0, sym0, dec1, sym1] = await Promise.all([
-        decimals(p.token0), symbol(p.token0),
-        decimals(p.token1), symbol(p.token1),
-      ]);
+  /** 2) Discover stakers/gauges (subgraph only) */
+  const stakers = await discoverStakers(slipClient);
+  if (STAKERS_FROM_ENV.length) notes.push(`Merged ${STAKERS_FROM_ENV.length} staker(s) from env.`);
+  if (!stakers.size) notes.push("No stakers/gauges found in subgraph (set SLIPSTREAM_STAKERS if you know them).");
 
-      // staked if current owner isn't one of your addresses (if addresses provided)
-      const ownerIsYou = addrs.length ? addrs.some(a => a === owner) : false;
-      const staked = addrs.length ? !ownerIsYou : (owner !== null); // if no address filter, just show owner
+  /** 3) Gauge-owned positions */
+  let gaugePositions: any[] = [];
+  if (stakers.size) {
+    const owners = Array.from(stakers);
+    let r = await tryQuery<any>(slipClient, POSITIONS_BY_OWNER_V1, { owners });
+    if (!r.ok) r = await tryQuery<any>(slipClient, POSITIONS_BY_OWNER_V2, { owners });
+    if (r.ok) gaugePositions = (r.data as any).positions ?? [];
+    else notes.push(`Gauge-owned positions query failed: ${r.err}`);
+  }
 
-      // optional: compute live tick & IN/OUT
-      let currentTick: number | null = null;
-      try { currentTick = await currentTickFor(p.token0, p.token1, p.fee); } catch {}
-      const inRange = (currentTick !== null)
-        ? (currentTick >= p.tickLower && currentTick <= p.tickUpper)
-        : null;
+  /** 4) Map staked tokenIds -> depositor */
+  const tokenIdsAtStaker = gaugePositions.map(p => String(p.id));
+  const depositorMap = new Map<string,string>();
 
-      items.push({
-        kind: "SLIPSTREAM",
-        owner,
-        tokenId,
-        poolId: null,
-        token0: { id: p.token0, symbol: sym0 || "T0", decimals: String(dec0 ?? 18) },
-        token1: { id: p.token1, symbol: sym1 || "T1", decimals: String(dec1 ?? 18) },
-        deposited: null,
-        current: null,
-        fees: { token0: String(parseUint(p.tokensOwed0)), token1: String(parseUint(p.tokensOwed1)) },
-        emissions: null,
-        range: { tickLower: p.tickLower, tickUpper: p.tickUpper, currentTick, status: currentTick === null ? "-" : (inRange ? "IN" : "OUT") },
-        staked,
-        __source: "rpc",
-      });
-    } catch (e: any) {
-      notes.push(`tokenId ${tokenId}: ${e.message || "read failed"}`);
+  // 4a) Prefer stake-mapping entities (exact mapping)
+  if (addrs.length) {
+    const m1 = await getStakeMappedTokenIds(slipClient, addrs);
+    for (const [k,v] of m1) depositorMap.set(k, v);
+    if (m1.size) notes.push(`Stake mapping matched ${m1.size} tokenId(s).`);
+  }
+
+  // 4b) Fill gaps via latest transfer (to staker; use 'from' as depositor)
+  const missingForTransfer = tokenIdsAtStaker.filter(tid => !depositorMap.has(tid));
+  if (missingForTransfer.length && stakers.size) {
+    const m2 = await mapDepositorsFromTransfers(slipClient, missingForTransfer, Array.from(stakers));
+    for (const [k,v] of m2) if (!depositorMap.has(k)) depositorMap.set(k, v);
+    if (m2.size) notes.push(`Transfer mapping matched ${m2.size} tokenId(s).`);
+  }
+
+  /** 5) Keep only your staked NFTs (depositor in query list) and rehydrate details if needed */
+  const yourStakedIds = tokenIdsAtStaker.filter(tid => addrs.includes(depositorMap.get(tid) || ""));
+  let yourStakedPositions: any[] = [];
+  if (yourStakedIds.length) {
+    // We may already have them in gaugePositions; otherwise requery by ids to ensure full fields
+    const have = new Set(gaugePositions.map(p => String(p.id)));
+    const needIds = yourStakedIds.filter(tid => !have.has(tid));
+    const selected = gaugePositions.filter(p => yourStakedIds.includes(String(p.id)));
+    if (needIds.length) {
+      const r = await tryQuery<any>(slipClient, POSITIONS_BY_IDS, { ids: needIds });
+      if (r.ok) {
+        yourStakedPositions = [...selected, ...((r.data as any).positions ?? [])];
+      } else {
+        yourStakedPositions = selected;
+        notes.push(`Positions by ids fallback failed: ${r.err}`);
+      }
+    } else {
+      yourStakedPositions = selected;
     }
   }
 
-  if (items.length) notes.push(`RPC mode: positions loaded ✅ (${items.length} rows).`);
-  if (!SLIPSTREAM_FACTORY) notes.push("Set SLIPSTREAM_FACTORY to compute IN/OUT reliably (pool.slot0).");
+  /** 6) Normalize + emit */
+  // a) wallet-owned (unstaked)
+  for (const p of walletPositions) {
+    const owner = p.owner?.id ?? p.owner;
+    const ticks = normalizeTicks(p);
+    items.push({
+      kind: "SLIPSTREAM",
+      owner,
+      tokenId: p.id,
+      poolId: p.pool?.id,
+      token0: p.pool?.token0, token1: p.pool?.token1,
+      deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
+      current: null,
+      fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
+      emissions: null,
+      range: ticks,
+      staked: false,
+    });
+  }
+
+  // b) your staked (gauge-owned but mapped to you). Show your address as 'owner'
+  for (const p of yourStakedPositions) {
+    const tid = String(p.id);
+    const depositor = depositorMap.get(tid);
+    // Skip if depositor not in your query (paranoia)
+    if (!depositor || !addrs.includes(depositor)) continue;
+    const ticks = normalizeTicks(p);
+    items.push({
+      kind: "SLIPSTREAM",
+      owner: depositor,               // show the actual depositor wallet
+      tokenId: p.id,
+      poolId: p.pool?.id,
+      token0: p.pool?.token0, token1: p.pool?.token1,
+      deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
+      current: null,
+      fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
+      emissions: null,
+      range: ticks,
+      staked: true,
+    });
+  }
+
+  notes.push(`Slipstream: positions loaded ✅ (${items.length} rows).`);
+  if (!stakers.size) notes.push("Note: No stakers discovered — set SLIPSTREAM_STAKERS=0xGaugeA,0xGaugeB to include gauge-owned NFTs.");
 
   return NextResponse.json({ items, notes });
 }
