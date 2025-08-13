@@ -356,7 +356,30 @@ export async function GET(req: NextRequest) {
   } else if (!BASE_RPC_URL && gaugePositions.length) {
     notes.push("Set BASE_RPC_URL (and optional RPC_START_BLOCK) to enable depositor mapping when the subgraph has no transfers.");
   }
+  // 4Z) As-last-resort: if caller passed tokenIds[] and either ?assume=1 (or there is exactly one wallet),
+// force-map those tokenIds (that are currently gauge-owned) to the chosen wallet so they show up.
+{
+  const qp = req.nextUrl.searchParams;
+  const assumeFlag = qp.get("assume") === "1";
+  const assumeOwnerParam = (qp.get("assumeOwner") || "").toLowerCase(); // optional explicit wallet
+  const chosen =
+    assumeOwnerParam ||
+    (assumeFlag && addrs.length >= 1 ? addrs[0] : (addrs.length === 1 ? addrs[0] : ""));
 
+  if (chosen && forcedIds.length && gaugePositions.length) {
+    const gaugeIdSet = new Set<string>(gaugePositions.map((p: any) => String(p.id)));
+    let assumed = 0;
+    for (const id of forcedIds) {
+      if (gaugeIdSet.has(id) && !depositorOf.has(id)) {
+        depositorOf.set(id, chosen);
+        assumed++;
+      }
+    }
+    if (assumed) {
+      notes.push(`Assumed depositor=${chosen} for ${assumed} tokenId(s) from tokenIds[].`);
+    }
+  }
+}
   // 5) your staked = gauge-owned filtered to depositor ∈ wallets
   const yourStakedIds = Array.from(new Set(
     gaugePositions.map((p: any) => String(p.id)).filter(tid => addrs.includes(depositorOf.get(tid) || ""))
