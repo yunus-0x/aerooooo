@@ -8,29 +8,21 @@
     "start": "next start",
     "lint": "next lint"
   },
-  "engines": {
-    "node": ">=18.17"
-  },
   "dependencies": {
-    "@tanstack/react-query": "^5.51.1",
-    "clsx": "^2.1.1",
-    "dayjs": "^1.11.11",
-    "graphql-request": "^7.1.1",
+    "ethers": "^6.13.2",
     "next": "14.2.5",
     "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "viem": "^2.9.21",
-    "zod": "^3.23.8"
-    "ethers": "^6.13.2"
+    "react-dom": "18.2.0"
   },
   "devDependencies": {
-    "@types/node": "24.2.1",
-    "@types/react": "19.1.10",
-    "autoprefixer": "^10.4.19",
+    "@types/node": "20.11.19",
+    "@types/react": "18.2.57",
+    "@types/react-dom": "18.2.19",
+    "typescript": "5.3.3",
     "eslint": "8.57.0",
-    "eslint-config-next": "14.2.5",
-    "postcss": "^8.4.38",
-    "tailwindcss": "^3.4.10",
-    "typescript": "^5.5.4"
+    "eslint-config-next": "14.2.5"
+  },
+  "engines": {
+    "node": ">=18.17"
   }
 }
