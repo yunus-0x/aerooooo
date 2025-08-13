@@ -1,3 +1,4 @@
+// app/api/positions/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { GraphQLClient, gql } from "graphql-request";
 
@@ -10,10 +11,13 @@ const STAKERS_FROM_ENV = (process.env.SLIPSTREAM_STAKERS || "")
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
-// RPC is only used as a last-resort for depositor mapping:
-const BASE_RPC_URL = process.env.BASE_RPC_URL || "";
 
-/* ========= Graph client ========= */
+// RPC is used only for depositor mapping fallback:
+const BASE_RPC_URL = process.env.BASE_RPC_URL || "";
+const SLIPSTREAM_NFPM = (process.env.SLIPSTREAM_NFPM || "0x827922686190790b37229fd06084350E74485b72").toLowerCase();
+const RPC_START_BLOCK_ENV = process.env.RPC_START_BLOCK || "";
+
+/* ========= GraphQL client ========= */
 function makeClient(url?: string) {
   if (!url) return null;
   const headers = SUBGRAPH_KEY
@@ -23,37 +27,7 @@ function makeClient(url?: string) {
 }
 const client = makeClient(SLIP_URL);
 
-/* ========= Small RPC helpers (fallback only) ========= */
-const ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const SLIPSTREAM_NFPM = (process.env.SLIPSTREAM_NFPM || "0x827922686190790b37229fd06084350E74485b72").toLowerCase();
-function toTopicAddress(addr: string) { return "0x" + "0".repeat(24) + addr.toLowerCase().replace(/^0x/,""); }
-function tokenIdToTopic(id: string | number | bigint) { return "0x" + BigInt(id).toString(16).padStart(64, "0"); }
-async function rpc(method: string, params: any[]) {
-  if (!BASE_RPC_URL) throw new Error("BASE_RPC_URL missing");
-  const res = await fetch(BASE_RPC_URL, {
-    method: "POST", headers: { "content-type":"application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
-  });
-  const j = await res.json();
-  if (j.error) throw new Error(j.error.message || "rpc error");
-  return j.result;
-}
-async function depositorFromLogs(tokenId: string, staker: string): Promise<string | null> {
-  try {
-    const logs = await rpc("eth_getLogs", [{
-      address: SLIPSTREAM_NFPM,
-      topics: [ ERC721_TRANSFER_TOPIC, null, toTopicAddress(staker), tokenIdToTopic(tokenId) ],
-      fromBlock: "0x1", toBlock: "latest"
-    }]);
-    if (!Array.isArray(logs) || logs.length === 0) return null;
-    logs.sort((a: any, b: any) => (BigInt(a.blockNumber) > BigInt(b.blockNumber) ? 1 : -1));
-    const last = logs[logs.length - 1];
-    const fromTopic = last.topics?.[1];
-    return fromTopic ? ("0x" + fromTopic.slice(-40)).toLowerCase() : null;
-  } catch { return null; }
-}
-
-/* ========= GQL utils ========= */
+/* ========= GQL Utils ========= */
 type Try<T> = { ok: true; data: T } | { ok: false; err: string };
 async function q<T>(c: GraphQLClient | null, query: any, vars?: any): Promise<Try<T>> {
   if (!c) return { ok: false, err: "no client" };
@@ -102,7 +76,7 @@ const STAKED_BY_USER_CANDIDATES = [
   gql`query($owners:[String!]!){ stakedNonFungiblePositions(where:{ account_in:$owners }) { tokenId account{ id } } }`,
 ];
 
-// Transfers to staker (to derive depositor if stake-mapping not available)
+// Transfers to staker (derive depositor when stake-mapping not available)
 const TRANSFERS_TO_STAKER = [
   gql`query($froms:[String!]!,$tos:[String!]!){
     positionTransfers(where:{ from_in:$froms, to_in:$tos }
@@ -130,7 +104,7 @@ const TRANSFERS_TO_STAKER = [
   }`,
 ];
 
-// Positions by ids
+// Positions by ids (rehydrate gauge-owned items)
 const POSITIONS_BY_IDS = gql`query($ids:[String!]!){
   positions(where:{ id_in:$ids }) {
     id owner liquidity
@@ -144,7 +118,81 @@ const POSITIONS_BY_IDS = gql`query($ids:[String!]!){
   }
 }`;
 
-/* ========= Helpers ========= */
+/* ========= Normalizers ========= */
+function normalizeTicks(p: any) {
+  const tl = (p as any).tickLower ?? (p as any).lowerTick ?? null;
+  const tu = (p as any).tickUpper ?? (p as any).upperTick ?? null;
+  const ct = (p as any).pool?.tick ?? (p as any).pool?.currentTick ?? null;
+  if (tl !== null && tu !== null && ct !== null) {
+    const tln = Number(tl), tun = Number(tu), ctn = Number(ct);
+    const status = ctn >= tln && ctn <= tun ? "IN" : "OUT";
+    return { tickLower: tln, tickUpper: tun, currentTick: ctn, status };
+  }
+  return { tickLower: tl, tickUpper: tu, currentTick: ct, status: "-" as const };
+}
+
+/* ========= RPC helpers (fallback) ========= */
+const ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+function toTopicAddress(addr: string) { return "0x" + "0".repeat(24) + addr.toLowerCase().replace(/^0x/, ""); }
+async function rpc(method: string, params: any[]) {
+  if (!BASE_RPC_URL) throw new Error("BASE_RPC_URL missing");
+  const res = await fetch(BASE_RPC_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  const j = await res.json();
+  if (j.error) throw new Error(j.error.message || "rpc error");
+  return j.result;
+}
+function toHex(n: number) { return "0x" + n.toString(16); }
+function parseBlockParam(v: string | null): number | null {
+  if (!v) return null;
+  if (v.startsWith("0x")) return Number(BigInt(v));
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Scan NFPM Transfer(from=wallet, to=staker) in block windows; return tokenIds */
+async function scanWalletToStaker(
+  wallet: string,
+  staker: string,
+  startBlock: number | null,
+  window: number,
+  maxLookback: number
+): Promise<Set<string>> {
+  const found = new Set<string>();
+  const headHex: string = await rpc("eth_blockNumber", []);
+  const head = Number(BigInt(headHex));
+
+  let end = head;
+  let scanned = 0;
+  const minStart = startBlock ?? 0;
+
+  while (end > minStart && scanned < maxLookback) {
+    const start = Math.max(minStart, end - window);
+    const fromBlock = toHex(start);
+    const toBlock = toHex(end);
+    const filter = {
+      address: SLIPSTREAM_NFPM,
+      topics: [ ERC721_TRANSFER_TOPIC, toTopicAddress(wallet), toTopicAddress(staker) ],
+      fromBlock, toBlock
+    };
+    try {
+      const logs: any[] = await rpc("eth_getLogs", [filter as any]);
+      for (const l of logs) {
+        const tidTopic = (l as any).topics?.[3];
+        if (tidTopic) found.add(BigInt(tidTopic).toString());
+      }
+    } catch { /* window may be too large; keep scanning */ }
+    scanned += window;
+    end = start;
+    if (found.size >= 500) break;
+  }
+  return found;
+}
+
+/* ========= Discovery ========= */
 async function discoverStakers(c: GraphQLClient | null): Promise<Set<string>> {
   const set = new Set<string>(STAKERS_FROM_ENV);
   if (!c) return set;
@@ -156,7 +204,7 @@ async function discoverStakers(c: GraphQLClient | null): Promise<Set<string>> {
                  (r.data as any).positionStakers ??
                  (r.data as any).nonfungiblePositionStakers ?? [];
     for (const g of rows) {
-      const id = String(g.id || "").toLowerCase();
+      const id = String((g as any).id || "").toLowerCase();
       if (id) set.add(id);
     }
     if (set.size) break;
@@ -164,18 +212,7 @@ async function discoverStakers(c: GraphQLClient | null): Promise<Set<string>> {
   return set;
 }
 
-function normalizeTicks(p: any) {
-  const tl = p.tickLower ?? p.lowerTick ?? null;
-  const tu = p.tickUpper ?? p.upperTick ?? null;
-  const ct = p.pool?.tick ?? p.pool?.currentTick ?? null;
-  if (tl !== null && tu !== null && ct !== null) {
-    const tln = Number(tl), tun = Number(tu), ctn = Number(ct);
-    const status = ctn >= tln && ctn <= tun ? "IN" : "OUT";
-    return { tickLower: tln, tickUpper: tun, currentTick: ctn, status };
-  }
-  return { tickLower: tl, tickUpper: tu, currentTick: ct, status: "-" as const };
-}
-
+/* ========= Route ========= */
 export async function GET(req: NextRequest) {
   const addrs = req.nextUrl.searchParams.getAll("addresses[]").map(a => a.toLowerCase()).filter(Boolean);
   if (!addrs.length) return NextResponse.json({ items: [], notes: ["Pass addresses[]=0x..."] });
@@ -187,10 +224,12 @@ export async function GET(req: NextRequest) {
 
   // 1) Wallet-owned positions
   let walletPositions: any[] = [];
-  { let r = await q<any>(client, POSITIONS_BY_OWNER_V1, { owners: addrs });
+  {
+    let r = await q<any>(client, POSITIONS_BY_OWNER_V1, { owners: addrs });
     if (!r.ok) r = await q<any>(client, POSITIONS_BY_OWNER_V2, { owners: addrs });
     if (r.ok) walletPositions = (r.data as any).positions ?? [];
-    else notes.push(`Wallet positions failed: ${r.err}`); }
+    else notes.push(`Wallet positions failed: ${r.err}`);
+  }
 
   // 2) Discover all stakers/gauges (cross-pool)
   const stakers = await discoverStakers(client);
@@ -218,8 +257,9 @@ export async function GET(req: NextRequest) {
       const d: any = r.data;
       const rows = d.stakedPositions ?? d.positionStakings ?? d.stakes ?? d.stakedNonFungiblePositions ?? [];
       for (const row of rows) {
-        const tid = String(row.tokenId ?? row.id ?? "");
-        const who = row.user?.id ?? row.owner?.id ?? row.account?.id ?? row.user ?? row.owner ?? row.account;
+        const tid = String((row as any).tokenId ?? (row as any).id ?? "");
+        const who = (row as any).user?.id ?? (row as any).owner?.id ?? (row as any).account?.id
+                 ?? (row as any).user ?? (row as any).owner ?? (row as any).account;
         if (tid && who) depositorOf.set(tid, String(who).toLowerCase());
       }
       if (depositorOf.size) { notes.push(`Stake mapping matched ${depositorOf.size} tokenId(s).`); break; }
@@ -237,8 +277,8 @@ export async function GET(req: NextRequest) {
                    (r.data as any).transfers ??
                    (r.data as any).transferEvents ?? [];
       for (const tr of rows) {
-        const tid = String(tr.tokenId ?? "");
-        const from = tr.from?.id ?? tr.from;
+        const tid = String((tr as any).tokenId ?? "");
+        const from = (tr as any).from?.id ?? (tr as any).from;
         if (tid && from && !depositorOf.has(tid)) depositorOf.set(tid, String(from).toLowerCase());
       }
       if (rows.length) { notes.push(`Transfer mapping matched ${rows.length} row(s).`); break; }
@@ -247,30 +287,55 @@ export async function GET(req: NextRequest) {
     notes.push("Skipped transfer mapping (no stakers discovered).");
   }
 
-  // 4C) RPC fallback (per-token, only if needed)
-  // Use only for gauge-owned tokens we couldn't map via subgraph
-if (BASE_RPC_URL && gaugePositions.length) {
-  const unmapped = gaugePositions
-    .map((p) => {
-      const stakerRaw = ((p?.owner?.id ?? p?.owner) ?? ""); // add parens to avoid ?? with ||
-      return { tid: String(p.id), staker: String(stakerRaw).toLowerCase() };
-    })
-    .filter((x) => x.tid && x.staker && !depositorOf.has(x.tid));
-    let rpcHits = 0;
-    for (const { tid, staker } of unmapped) {
-      const dep = await depositorFromLogs(tid, staker);
-      if (dep) { depositorOf.set(tid, dep); rpcHits++; }
+  // 4C) RPC fallback (chunked wallet→staker scan)
+  if (BASE_RPC_URL && gaugePositions.length) {
+    // collect unique stakers from the subgraph's gauge-owned set
+    const stakerSet = new Set<string>();
+    for (const p of gaugePositions) {
+      const ownerField = (p as any)?.owner?.id !== undefined && (p as any)?.owner?.id !== null
+        ? (p as any).owner.id
+        : (p as any)?.owner;
+      const s = String((ownerField ?? "")).toLowerCase();
+      if (s) stakerSet.add(s);
     }
-    if (rpcHits) notes.push(`RPC depositor mapping matched ${rpcHits} tokenId(s).`);
-    if (!rpcHits && unmapped.length) notes.push(`RPC mapping found 0 of ${unmapped.length} (provider may limit logs).`);
+    const stakersForScan = Array.from(stakerSet);
+
+    // scan parameters (URL overrides > env > defaults)
+    const qp = req.nextUrl.searchParams;
+    const startBlockFromQP = parseBlockParam(qp.get("startBlock"));
+    const windowFromQP = parseBlockParam(qp.get("window"));
+    const lookbackFromQP = parseBlockParam(qp.get("maxLookback"));
+    const startBlockFromEnv = parseBlockParam(RPC_START_BLOCK_ENV || null);
+
+    const startBlock = startBlockFromQP ?? startBlockFromEnv ?? null;
+    const window = windowFromQP ?? 50_000;
+    const maxLookback = lookbackFromQP ?? 150_000_000;
+
+    // gauge-owned tokenIds set (so we only keep those)
+    const gaugeIds = new Set<string>(gaugePositions.map((p: any) => String(p.id)));
+
+    let rpcHits = 0;
+    for (const w of addrs) {
+      for (const s of stakersForScan) {
+        const tokenIds = await scanWalletToStaker(w, s, startBlock, window, maxLookback);
+        for (const tid of tokenIds) {
+          if (gaugeIds.has(tid) && !depositorOf.has(tid)) {
+            depositorOf.set(tid, w.toLowerCase());
+            rpcHits++;
+          }
+        }
+      }
+    }
+    if (rpcHits) notes.push(`RPC depositor mapping (chunked) matched ${rpcHits} tokenId(s).`);
+    else notes.push(`RPC depositor mapping (chunked) matched 0 — try &startBlock= or bigger &maxLookback.`);
   } else if (!BASE_RPC_URL && gaugePositions.length) {
-    notes.push("Set BASE_RPC_URL to enable depositor mapping when the subgraph has no transfers.");
+    notes.push("Set BASE_RPC_URL (and optional RPC_START_BLOCK) to enable depositor mapping when the subgraph lacks transfers.");
   }
 
   // 5) Keep only your staked tokenIds (depositor ∈ addrs), rehydrate via positions-by-ids
   const stakedIds = Array.from(new Set(
     gaugePositions
-      .map(p => String(p.id))
+      .map(p => String((p as any).id))
       .filter(tid => addrs.includes(depositorOf.get(tid) || ""))
   ));
   let yourStaked: any[] = [];
@@ -285,16 +350,19 @@ if (BASE_RPC_URL && gaugePositions.length) {
   // 6) Emit
   const seen = new Set<string>();
   for (const p of walletPositions) {
-    const tid = String(p.id); if (seen.has(tid)) continue; seen.add(tid);
+    const tid = String((p as any).id); if (seen.has(tid)) continue; seen.add(tid);
+    const ownerField = (p as any)?.owner?.id !== undefined && (p as any)?.owner?.id !== null
+      ? (p as any).owner.id
+      : (p as any)?.owner;
     items.push({
       kind: "SLIPSTREAM",
-      owner: (p.owner?.id ?? p.owner),
-      tokenId: p.id,
-      poolId: p.pool?.id,
-      token0: p.pool?.token0, token1: p.pool?.token1,
-      deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
+      owner: ownerField,
+      tokenId: (p as any).id,
+      poolId: (p as any).pool?.id,
+      token0: (p as any).pool?.token0, token1: (p as any).pool?.token1,
+      deposited: { token0: (p as any).depositedToken0 ?? "0", token1: (p as any).depositedToken1 ?? "0" },
       current: null,
-      fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
+      fees: { token0: (p as any).collectedFeesToken0 ?? "0", token1: (p as any).collectedFeesToken1 ?? "0" },
       emissions: null,
       range: normalizeTicks(p),
       staked: false,
@@ -302,17 +370,17 @@ if (BASE_RPC_URL && gaugePositions.length) {
   }
 
   for (const p of yourStaked) {
-    const tid = String(p.id); if (seen.has(tid)) continue; seen.add(tid);
+    const tid = String((p as any).id); if (seen.has(tid)) continue; seen.add(tid);
     const depositor = depositorOf.get(tid);
     items.push({
       kind: "SLIPSTREAM",
-      owner: depositor || (p.owner?.id ?? p.owner),  // display depositor if known
-      tokenId: p.id,
-      poolId: p.pool?.id,
-      token0: p.pool?.token0, token1: p.pool?.token1,
-      deposited: { token0: p.depositedToken0 ?? "0", token1: p.depositedToken1 ?? "0" },
+      owner: depositor || (((p as any)?.owner?.id !== undefined && (p as any)?.owner?.id !== null) ? (p as any).owner.id : (p as any)?.owner),
+      tokenId: (p as any).id,
+      poolId: (p as any).pool?.id,
+      token0: (p as any).pool?.token0, token1: (p as any).pool?.token1,
+      deposited: { token0: (p as any).depositedToken0 ?? "0", token1: (p as any).depositedToken1 ?? "0" },
       current: null,
-      fees: { token0: p.collectedFeesToken0 ?? "0", token1: p.collectedFeesToken1 ?? "0" },
+      fees: { token0: (p as any).collectedFeesToken0 ?? "0", token1: (p as any).collectedFeesToken1 ?? "0" },
       emissions: null,
       range: normalizeTicks(p),
       staked: true,
